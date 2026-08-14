@@ -1032,6 +1032,22 @@ impl Simulator {
 fn materialise_partition(replica: &SimReplica, namespace: IggyNamespace) {
     let shard_count = u32::try_from(replica.shards.len()).expect("shard count fits u32");
     let owner = calculate_shard_assignment(&namespace, shard_count);
+    // Commit the namespace before anything else: a partition the metadata plane
+    // never heard of is a shape production cannot produce, and the shard refuses
+    // to serve client traffic whose routing-row epoch it cannot match against a
+    // committed `created_revision`.
+    let streams = replica.shards[0].plane.metadata().mux_stm.streams();
+    streams.seed_namespace(namespace, namespace.inner());
+    // No committed revision means the seed could not re-add the namespace, which
+    // happens once a metadata workload has deleted its stream or topic: the seed's
+    // `CreatePartitions` is then a committed REJECTION, not an error, so it
+    // reports nothing. Skip the group rather than build a partition no committed
+    // metadata names -- a rebooted server does not re-open a deleted partition's
+    // directory either. Checked before the build so a skipped group leaves
+    // neither a partition nor a routing row behind.
+    let Some(epoch) = streams.created_revision_for_namespace(namespace) else {
+        return;
+    };
     // One store per group, minted on first materialisation and reused on every
     // later one, so the recorded view survives a replica restart.
     let superblock = Rc::clone(
@@ -1055,15 +1071,6 @@ fn materialise_partition(replica: &SimReplica, namespace: IggyNamespace) {
         recovered_state,
         retained,
     );
-    // Commit the namespace before stamping the rows: a partition the metadata
-    // plane never heard of is a shape production cannot produce, and the shard
-    // refuses to serve client traffic whose routing-row epoch it cannot match
-    // against a committed `created_revision`.
-    let streams = replica.shards[0].plane.metadata().mux_stm.streams();
-    streams.seed_namespace(namespace, namespace.inner());
-    let epoch = streams
-        .created_revision_for_namespace(namespace)
-        .expect("namespace committed by the seed above");
     for shard in &replica.shards {
         shard.shards_table().insert(
             namespace,
