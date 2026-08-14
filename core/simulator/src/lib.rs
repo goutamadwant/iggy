@@ -67,6 +67,18 @@ const POLL_BUDGET: u32 = 100_000;
 /// keeps those draws from perturbing network or workload traces.
 pub const ENTRY_SHARD_SEED_SALT: u64 = 0x5A1A_F0E5_FACE_0003;
 
+/// Steps a setup handshake (`register_client_with_primary`, `shell_login`) waits
+/// before resubmitting its request, and the total it will spend.
+///
+/// These helpers used to submit once and give up, which is sound only on a
+/// perfect network: under injected packet loss the request or its reply is
+/// eventually dropped and the fixture fails before the workload ever starts.
+/// Both requests are metadata-plane ops carrying a stable request id, so the
+/// client table dedups a resend and replays the cached reply rather than
+/// committing twice.
+const SETUP_RETRY_STEPS: u32 = 50;
+const SETUP_TOTAL_STEPS: u32 = 4_000;
+
 /// One simulated replica: its shards plus the executor bookkeeping needed
 /// to crash it. One entry per shard in `shards`/`pump_tasks` (a single
 /// shard until multi-shard lands).
@@ -412,7 +424,8 @@ impl Simulator {
     /// (replica 0), as [`Self::register_client_with_primary`] does.
     ///
     /// # Panics
-    /// If no login reply arrives within 200 steps or it carries no session.
+    /// If no login reply arrives within [`SETUP_TOTAL_STEPS`], or it carries no
+    /// session.
     pub fn shell_login(&mut self, client: &SimClient) {
         // Register the client's connection metadata on every replica, as
         // `install_client_fd` does in production. `ensure_transport_connection`
@@ -427,22 +440,44 @@ impl Simulator {
             ));
         }
 
-        let msg = client.login(replica::SHELL_ROOT_USERNAME, replica::SHELL_ROOT_PASSWORD);
-        self.submit_request(client.client_id(), 0, msg.into_generic());
-        let mut session = 0u64;
-        let mut got_reply = false;
-        for _ in 0..200 {
-            if let Some(reply) = self.step().first() {
-                // The login reply carries the assigned session in `op`
-                // (`build_reply_with_body` maps the session field to `op`).
-                session = reply.header().op;
-                got_reply = true;
-                break;
-            }
-        }
-        assert!(got_reply, "shell_login: no login reply within 200 steps");
+        let msg = client
+            .login(replica::SHELL_ROOT_USERNAME, replica::SHELL_ROOT_PASSWORD)
+            .into_generic();
+        // The login reply carries the assigned session in `op`
+        // (`build_reply_with_body` maps the session field to `op`).
+        let session = self
+            .await_setup_reply(client.client_id(), 0, &msg, "shell_login")
+            .map_or(0, |reply| reply.header().op);
         assert!(session > 0, "shell_login: login reply carried no session");
         client.bind_session(session);
+    }
+
+    /// Submit `message` to `target` and step until a client reply arrives,
+    /// resubmitting every [`SETUP_RETRY_STEPS`] steps.
+    ///
+    /// Returns the first reply, or `None` once [`SETUP_TOTAL_STEPS`] is spent.
+    /// The same message is resubmitted verbatim, so the request id is stable and
+    /// the metadata client table treats a retry as a duplicate.
+    fn await_setup_reply(
+        &mut self,
+        client_id: u128,
+        target: u8,
+        message: &Message<GenericHeader>,
+        label: &str,
+    ) -> Option<Message<ReplyHeader>> {
+        for step in 0..SETUP_TOTAL_STEPS {
+            if step % SETUP_RETRY_STEPS == 0 {
+                self.submit_request(client_id, target, message.deep_copy());
+            }
+            if let Some(reply) = self.step().into_iter().next() {
+                return Some(reply);
+            }
+        }
+        panic!(
+            "{label}: no reply for client {client_id} within {SETUP_TOTAL_STEPS} steps \
+             (seed {:#x})",
+            self.seed,
+        );
     }
 
     /// Advance the simulation by one tick. Returns client replies delivered.
@@ -633,17 +668,14 @@ impl Simulator {
     /// `SimClient`.
     ///
     /// # Panics
-    /// If no reply arrives within 100 steps.
+    /// If no reply arrives within [`SETUP_TOTAL_STEPS`].
     #[allow(clippy::cast_possible_truncation)]
     pub fn register_client_with_primary(&mut self, client: &SimClient) {
-        let msg = client.register();
-        self.submit_request(client.client_id(), 0, msg.into_generic());
-        let mut session = 0u64;
-        let mut got_reply = false;
-        for _ in 0..100 {
-            let replies = self.step();
-            if !replies.is_empty() {
-                let header = replies[0].header();
+        let msg = client.register().into_generic();
+        let session = self
+            .await_setup_reply(client.client_id(), 0, &msg, "register_client_with_primary")
+            .map_or(0, |reply| {
+                let header = reply.header();
                 debug_assert_eq!(
                     header.operation,
                     iggy_binary_protocol::Operation::Register,
@@ -657,15 +689,8 @@ impl Simulator {
                     client.client_id(),
                     header.client,
                 );
-                session = header.commit;
-                got_reply = true;
-                break;
-            }
-        }
-        assert!(
-            got_reply,
-            "register_client_with_primary: no reply within 100 steps"
-        );
+                header.commit
+            });
         client.bind_session(session);
 
         // Partition has no `client_table`: at-least-once, no per-client
@@ -2009,6 +2034,70 @@ mod tests {
         assert!(
             oracle::drive_to_quiesce(&mut sim, &mut wl, 5_000),
             "surviving quorum did not drain within the tick budget"
+        );
+        oracle::assert_converged(&sim, &wl);
+    }
+
+    /// A lossy network drains, because the client resends.
+    ///
+    /// Without [`workload::Workload::due_resends`] this wedges immediately and
+    /// permanently: a client holds one in-flight slot, nothing times out, so the
+    /// first dropped request or reply strands that slot for the rest of the run.
+    /// At 5% loss a 3000-tick run used to drain a handful of replies and then
+    /// stop, and `drive_to_quiesce` could never finish because the reply it
+    /// waited on had already been discarded by the network.
+    ///
+    /// Asserts the resend path actually ran rather than the seed getting lucky.
+    #[test]
+    fn packet_loss_resends_and_drains() {
+        use crate::workload::{
+            self, Workload,
+            options::{ActionWeights, WorkloadOptions},
+            oracle,
+        };
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let seed = 0x105_5A1A;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed,
+            packet_loss_probability: 0.05,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = client::SimClient::new(client_id);
+        let ns_a = server_common::sharding::IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns_a);
+        sim.register_client_with_primary(&client);
+
+        let mut options = WorkloadOptions::new(seed, replica_count, vec![ns_a]);
+        options.weights = ActionWeights::partition_only();
+        let mut wl = Workload::new(options);
+
+        let clients = [client];
+        let replies = workload::run(&mut sim, &mut wl, &clients, 3_000, u64::MAX);
+        assert!(replies > 0, "lossy workload produced no replies");
+        assert!(
+            wl.resends() > 0,
+            "no request timed out at 5% packet loss, so the resend path never ran; \
+             raise the loss rate or lower request_timeout_ticks"
+        );
+
+        assert!(
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 20_000),
+            "{}",
+            oracle::quiesce_failure_report(&sim, &wl),
         );
         oracle::assert_converged(&sim, &wl);
     }

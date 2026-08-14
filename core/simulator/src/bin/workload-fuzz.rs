@@ -401,24 +401,29 @@ fn main() {
     );
 
     if quiesce {
-        if oracle::drive_to_quiesce(&mut sim, &mut workload, 50_000) {
-            oracle::assert_converged(&sim, &workload);
-            println!("quiesced and converged (leader-relative + entity oracle)");
-        } else {
-            println!(
-                "WARN: did not quiesce within budget — expected when crashing to bare quorum; \
-                 per-tick invariants still held"
-            );
-        }
+        // A failed drain is a hard failure, not a warning. It used to be one
+        // because a lost request could not be retried, so a stall was expected
+        // and unactionable; with the client resending, a request that never gets
+        // answered inside the budget is either a wedge or a liveness bug, and
+        // the report says which replicas were live and what they believed.
+        assert!(
+            oracle::drive_to_quiesce(&mut sim, &mut workload, 50_000),
+            "{}",
+            oracle::quiesce_failure_report(&sim, &workload),
+        );
+        oracle::assert_converged(&sim, &workload);
+        println!("quiesced and converged (leader-relative + entity oracle)");
     }
 
     let stats = workload.auditor.stats();
     println!(
-        "coverage: replies_seen={} replies_unknown={} committed_rejections={} samples_none={}",
+        "coverage: replies_seen={} replies_unknown={} committed_rejections={} \
+         samples_none={} resends={}",
         stats.replies_seen,
         stats.replies_unknown,
         stats.committed_rejections,
         workload.samples_none(),
+        workload.resends(),
     );
     for action in Action::iter() {
         let commits = stats.commits(action);

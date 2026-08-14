@@ -19,6 +19,14 @@ use crate::workload::actions::Action;
 use server_common::sharding::IggyNamespace;
 use strum::EnumCount;
 
+/// Default [`WorkloadOptions::request_timeout_ticks`].
+///
+/// Four times the primary's commit-broadcast interval (50 ticks, see
+/// `oracle::QUIESCE_SETTLE_TICKS`), so a request whose commit is merely waiting
+/// on the next broadcast is never resent, while one lost to a dropped packet or
+/// a crashed primary is retried long before the run's budget runs out.
+pub const DEFAULT_REQUEST_TIMEOUT_TICKS: u64 = 200;
+
 /// Per-action sampling weights as percentages. Unlisted variants default
 /// to 0 (never picked). Listed weights must sum to 100.
 #[derive(Debug, Clone, Copy)]
@@ -171,6 +179,14 @@ pub struct WorkloadOptions {
     /// Floor on live replicas the driver will not crash below, preserving a
     /// commit quorum. Defaults to `replica_count / 2 + 1`.
     pub min_survivors: u8,
+    /// Ticks a request may stay outstanding before the client resends it.
+    ///
+    /// Must clear the primary's commit-broadcast interval with room to spare, or
+    /// a client resends work that was about to be answered and the run spends
+    /// its budget on duplicates. Must also stay well under the tick budget, or a
+    /// request lost to a dropped packet never gets retried and the client's slot
+    /// strands. `0` disables resending.
+    pub request_timeout_ticks: u64,
 }
 
 impl WorkloadOptions {
@@ -191,6 +207,7 @@ impl WorkloadOptions {
             max_offset: 1_000_000,
             crash_per_tick_ratio: 0.0,
             min_survivors: replica_count / 2 + 1,
+            request_timeout_ticks: DEFAULT_REQUEST_TIMEOUT_TICKS,
         }
     }
 }

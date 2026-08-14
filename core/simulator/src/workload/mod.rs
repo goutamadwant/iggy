@@ -49,22 +49,49 @@ use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::SeedableRng;
 use server_common::Message;
 use shadow::Shadow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 /// Max in-flight requests per client. Must stay under the consensus
 /// pipeline's queue limits.
 pub const CLIENT_REQUEST_QUEUE_MAX: usize = 1;
+
+/// An outstanding request, retained so the client can resend it.
+///
+/// The encoded message is kept verbatim rather than rebuilt from the sampled
+/// `Input`, because rebuilding would draw a fresh request id from the client and
+/// a resend must reuse the original: that id is what the metadata plane's client
+/// table dedups on, so a renumbered retry commits a second time instead of
+/// returning the cached reply.
+struct Outstanding {
+    message: Message<RoutedRequestHeader>,
+    /// Replica the most recent attempt went to. A resend moves to the next one,
+    /// so a client whose primary died eventually finds the new one.
+    target: u8,
+    /// Tick of the most recent attempt, not of the first.
+    attempted_tick: u64,
+    attempts: u32,
+}
 
 pub struct Workload {
     prng: Xoshiro256Plus,
     pub auditor: ServerAuditor,
     pub shadow: Shadow,
     pub options: WorkloadOptions,
-    /// Number of in-flight requests per client.
+    /// Outstanding requests keyed exactly as the auditor keys its expectations,
+    /// so the two are removed together.
+    ///
+    /// A `BTreeMap`, not a `HashMap`: [`Self::due_resends`] walks it and the
+    /// resulting submit order is observable, so hash iteration order would make
+    /// replay diverge from the seed.
     ///
     /// TODO: reap on client disconnect; bounded today by the fixed
     /// `Simulator::new` set.
-    in_flight_per_client: HashMap<u128, usize>,
+    outstanding: BTreeMap<(u128, u64), Outstanding>,
+    /// Driver tick, advanced by [`Self::tick`]. A driver that never ticks never
+    /// resends, which is what the hand-written scenario tests rely on.
+    now: u64,
+    /// Total resends issued, for the run summary.
+    resends: u64,
     /// Debug counter for `sample()` returning `None` (a targeted outcome whose
     /// shadow precondition is unmet). Flags PRNG-trace drift during development.
     samples_none: u64,
@@ -90,7 +117,9 @@ impl Workload {
             auditor: ServerAuditor::new(),
             shadow,
             options,
-            in_flight_per_client: HashMap::new(),
+            outstanding: BTreeMap::new(),
+            now: 0,
+            resends: 0,
             samples_none: 0,
             strict_outcome_oracle,
         }
@@ -99,18 +128,83 @@ impl Workload {
     /// True if the client has a free in-flight slot.
     #[must_use]
     pub fn client_idle(&self, client_id: u128) -> bool {
-        self.in_flight_per_client
-            .get(&client_id)
-            .copied()
-            .unwrap_or(0)
-            < CLIENT_REQUEST_QUEUE_MAX
+        self.client_in_flight(client_id) < CLIENT_REQUEST_QUEUE_MAX
     }
 
     /// Total in-flight requests across all clients. Read by the
     /// [`Invariants`]; draws no PRNG.
     #[must_use]
     pub(crate) fn total_in_flight(&self) -> usize {
-        self.in_flight_per_client.values().copied().sum()
+        self.outstanding.len()
+    }
+
+    /// Advance the resend clock by one tick. Called once per driver iteration;
+    /// [`Self::due_resends`] measures against it.
+    pub fn tick(&mut self) {
+        self.now += 1;
+    }
+
+    /// Total resends issued so far.
+    #[must_use]
+    pub const fn resends(&self) -> u64 {
+        self.resends
+    }
+
+    /// Requests whose reply has not arrived within
+    /// [`WorkloadOptions::request_timeout_ticks`], each paired with the replica
+    /// to retry it against. Callers must submit every returned message.
+    ///
+    /// This is what a real client's read timeout does, and the harness needs it
+    /// for two reasons. A dropped request or reply otherwise strands the
+    /// client's only in-flight slot for the rest of the run, so any packet loss
+    /// wedges the workload. And a request lost to a crashed primary can only be
+    /// answered by the next one, which the client reaches by rotating its
+    /// target.
+    ///
+    /// Resending is safe on both planes but not equally cheap: the metadata
+    /// plane dedups on the retained request id and replays the cached reply,
+    /// while the partition plane is at-least-once and may commit the op twice.
+    /// The shadow already models that (`Effect` application is driven by what
+    /// committed, not by what was targeted).
+    #[must_use = "returned requests must be submitted or the client stays wedged"]
+    pub fn due_resends(&mut self) -> Vec<(u8, Message<RoutedRequestHeader>)> {
+        let timeout = self.options.request_timeout_ticks;
+        if timeout == 0 {
+            return Vec::new();
+        }
+        let replica_count = self.options.replica_count.max(1);
+        let now = self.now;
+        let mut due = Vec::new();
+        for entry in self.outstanding.values_mut() {
+            if now.saturating_sub(entry.attempted_tick) < timeout {
+                continue;
+            }
+            entry.target = (entry.target + 1) % replica_count;
+            entry.attempted_tick = now;
+            entry.attempts += 1;
+            due.push((entry.target, entry.message.deep_copy()));
+        }
+        self.resends += due.len() as u64;
+        due
+    }
+
+    /// Outstanding requests as `(client, request, target, attempts)`, in key
+    /// order. Diagnostic only: names what a run was still waiting on when it
+    /// failed to drain.
+    #[must_use]
+    pub(crate) fn outstanding_summary(&self) -> Vec<(u128, u64, u8, u32)> {
+        self.outstanding
+            .iter()
+            .map(|(&(client, request), entry)| (client, request, entry.target, entry.attempts))
+            .collect()
+    }
+
+    /// In-flight count for one client. Keys are `(client, request)`, so the
+    /// client's entries are one contiguous range.
+    fn client_in_flight(&self, client_id: u128) -> usize {
+        self.outstanding
+            .range((client_id, 0)..=(client_id, u64::MAX))
+            .count()
     }
 
     /// Aggregate in-flight ceiling: one queue's worth per declared client.
@@ -173,10 +267,15 @@ impl Workload {
                 request_namespace: header.group,
             },
         );
-        *self
-            .in_flight_per_client
-            .entry(client.client_id())
-            .or_insert(0) += 1;
+        self.outstanding.insert(
+            key,
+            Outstanding {
+                message: message.deep_copy(),
+                target,
+                attempted_tick: self.now,
+                attempts: 1,
+            },
+        );
 
         Some((target, message))
     }
@@ -200,7 +299,7 @@ impl Workload {
             OnReply::Match(entry) => entry,
             OnReply::NsMismatch => {
                 // Entry consumed; release slot, skip effects (misrouted).
-                self.decrement_in_flight(header.client);
+                self.release_outstanding(key);
                 return Vec::new();
             }
             OnReply::Unknown => return Vec::new(),
@@ -283,24 +382,27 @@ impl Workload {
             self.auditor.note_committed(entry.action);
         }
 
-        self.decrement_in_flight(header.client);
+        self.release_outstanding(key);
 
         result.sim_commands
     }
 
-    /// Release one in-flight slot. Panics on underflow so a future
-    /// double-decrement surfaces instead of being silently clamped.
+    /// Drop a request's retry entry, freeing the client's slot. Paired with the
+    /// auditor consuming its expectation for the same key, so the two never
+    /// disagree about what is outstanding.
     ///
     /// # Panics
-    /// Panics if no entry exists for `client`, or if the counter is 0.
-    fn decrement_in_flight(&mut self, client: u128) {
-        let count = self
-            .in_flight_per_client
-            .get_mut(&client)
-            .expect("decrement_in_flight: no entry for client; record_in_flight must precede");
-        *count = count
-            .checked_sub(1)
-            .expect("in_flight underflow: per-client counter went below 0");
+    /// Panics if no entry exists for `key`; the auditor only reports a match or
+    /// a namespace mismatch for a key it was given, and `build_request` records
+    /// both sides together, so a miss here means the two drifted.
+    fn release_outstanding(&mut self, key: (u128, u64)) {
+        assert!(
+            self.outstanding.remove(&key).is_some(),
+            "no outstanding entry for (client={}, request={}); the auditor \
+             matched a key the retry buffer never recorded",
+            key.0,
+            key.1,
+        );
     }
 
     /// Debug counter for `sample()` returning `None`. Surfaces sampling
@@ -374,9 +476,13 @@ pub fn run(
     let mut fault_prng = Xoshiro256Plus::seed_from_u64(workload.options.seed ^ FAULT_SEED_SALT);
     let mut replies_seen = 0u64;
     for _ in 0..tick_budget {
+        workload.tick();
         if workload.options.crash_per_tick_ratio > 0.0 {
             maybe_inject_crash(sim, workload, &mut fault_prng);
         }
+        // Resend before sampling: a timed-out request still holds the client's
+        // slot, so `build_request` would decline it anyway.
+        resubmit_due(sim, workload);
         for client in clients {
             if let Some((target, msg)) = workload.build_request(client) {
                 sim.submit_request(client.client_id(), target, msg.into_generic());
@@ -437,6 +543,17 @@ fn maybe_inject_crash(sim: &mut Simulator, workload: &Workload, prng: &mut Xoshi
     }
     let victim = eligible[prng.random_range(0..eligible.len())];
     sim.replica_crash(victim);
+}
+
+/// Submit every request whose reply is overdue (see [`Workload::due_resends`]).
+///
+/// The client id rides the retained message's header, so a resend re-enters the
+/// network exactly as the original did, only aimed at the next replica.
+pub fn resubmit_due(sim: &mut Simulator, workload: &mut Workload) {
+    for (target, message) in workload.due_resends() {
+        let client_id = message.header().client;
+        sim.submit_request(client_id, target, message.into_generic());
+    }
 }
 
 /// Apply `SimCommand`s returned by [`Workload::on_reply`].

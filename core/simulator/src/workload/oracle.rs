@@ -38,7 +38,7 @@
 use crate::Simulator;
 use crate::replica::Replica;
 use crate::workload::shadow::Shadow;
-use crate::workload::{Workload, apply_sim_commands};
+use crate::workload::{Workload, apply_sim_commands, resubmit_due};
 use consensus::{MetadataHandle, Status};
 use metadata::impls::metadata::StreamsFrontend;
 use std::collections::BTreeSet;
@@ -96,6 +96,11 @@ impl CommittedMetadata {
 pub fn drive_to_quiesce(sim: &mut Simulator, workload: &mut Workload, max_ticks: u64) -> bool {
     let mut drained = false;
     for _ in 0..max_ticks {
+        // The drain keeps resending: a request lost on the way out is never
+        // answered, so without retries the drain would spend its whole budget
+        // waiting on a reply that cannot arrive.
+        workload.tick();
+        resubmit_due(sim, workload);
         for reply in sim.step() {
             let cmds = workload.on_reply(&reply);
             apply_sim_commands(sim, &cmds);
@@ -115,6 +120,52 @@ pub fn drive_to_quiesce(sim: &mut Simulator, workload: &mut Workload, max_ticks:
         }
     }
     true
+}
+
+/// Why the run did not drain, as a multi-line report.
+///
+/// A failed drain is either a wedge or a cluster that is merely slow, and the
+/// bare boolean [`drive_to_quiesce`] returns cannot tell them apart. Once
+/// crashes, restarts and packet loss are all in play, that distinction is the
+/// whole diagnosis, so name what is still outstanding and what every live
+/// replica thinks the world looks like.
+#[must_use]
+pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
+    use std::fmt::Write;
+
+    let mut report = format!(
+        "did not drain: {} request(s) still outstanding (seed={:#x})\n",
+        workload.total_in_flight(),
+        workload.options.seed,
+    );
+    for (client, request, target, attempts) in workload.outstanding_summary() {
+        let _ = writeln!(
+            report,
+            "  outstanding client={client} request={request} \
+             last_target=replica {target} attempts={attempts}",
+        );
+    }
+    let _ = writeln!(report, "  resends issued: {}", workload.resends());
+    for replica_idx in 0..sim.replica_count {
+        if sim.is_crashed(replica_idx) {
+            let _ = writeln!(report, "  replica {replica_idx}: CRASHED");
+            continue;
+        }
+        let _ = write!(report, "  replica {replica_idx}: live");
+        for &ns in &workload.options.namespaces {
+            let view = sim.consensus_view(usize::from(replica_idx), ns);
+            let commit = sim
+                .offsets(usize::from(replica_idx), ns)
+                .map(|offsets| offsets.commit_offset);
+            let primary = sim.primary_index(ns);
+            let _ = write!(
+                report,
+                " | ns {ns:?} view={view:?} commit_offset={commit:?} primary={primary:?}",
+            );
+        }
+        report.push('\n');
+    }
+    report
 }
 
 /// Post-drain consensus checks that hold today.
