@@ -33,6 +33,7 @@ pub mod ops;
 pub mod options;
 pub mod oracle;
 pub mod shadow;
+pub mod state_checker;
 
 use crate::Simulator;
 use crate::client::SimClient;

@@ -23,22 +23,22 @@
 //!
 //! - no live replica is ahead of the leader on any namespace (a backup ahead of
 //!   the leader is a split-brain / divergence bug),
+//! - every live replica agrees with every other on each committed metadata op
+//!   they both hold, the real consensus property (see
+//!   [`super::state_checker`]),
 //! - on a serial run, the workload's predicted [`Shadow`] equals the metadata
 //!   committed on the leader, the payoff of the name-keyed shadow.
 //!
-//! Full cross-replica EQUALITY (every live replica holding the same committed
-//! log) is the real consensus property, but it is not asserted yet. Backups
-//! apply prepares in strict order and drop any gap (`op != current_op + 1` in
-//! `metadata::on_replicate` / `iggy_partition`), relying on the primary's
-//! retransmit and the repair sessions (`MetadataRepairSession` / partition
-//! `RepairSession`) to refill. Message repair has landed on both planes, so
-//! the equality assert is unblocked but not yet re-enabled: the sim must
-//! first drive quiesce long enough for repair rounds to converge.
+//! Equality is asserted over the committed PREFIX, not over equal heads: a
+//! replica that missed the last commit broadcast, or that rejoined recently, may
+//! legitimately trail. What it may not do is hold different history at an op it
+//! did commit. Requiring equal heads instead would fail on ordinary lag and say
+//! nothing extra about safety.
 
 use crate::Simulator;
 use crate::replica::Replica;
 use crate::workload::shadow::Shadow;
-use crate::workload::{Workload, apply_sim_commands, resubmit_due};
+use crate::workload::{Workload, apply_sim_commands, resubmit_due, state_checker};
 use consensus::{MetadataHandle, Status};
 use metadata::impls::metadata::StreamsFrontend;
 use std::collections::BTreeSet;
@@ -72,14 +72,25 @@ struct CommittedMetadata {
 impl CommittedMetadata {
     /// Restrict to workload-generated entities (see [`WORKLOAD_PREFIX`]), so the
     /// entity oracle compares like with like against the shadow.
+    ///
+    /// Every level is filtered on its OWN name, not on its stream's. The harness
+    /// seeds filler topics and partitions of its own (`sim-topic-*`, see
+    /// `Streams::seed_namespace`) to keep slab ids dense, and once the workload
+    /// has created enough streams those fillers land inside a stream named
+    /// `wl-...`. Filtering topics by their stream alone then admits harness state
+    /// into the comparison and the shadow is blamed for not predicting it.
     fn workload_owned(mut self) -> Self {
         self.streams
             .retain(|name| name.starts_with(WORKLOAD_PREFIX));
-        self.topics
-            .retain(|(stream, _)| stream.starts_with(WORKLOAD_PREFIX));
+        self.topics.retain(|(stream, topic)| {
+            stream.starts_with(WORKLOAD_PREFIX) && topic.starts_with(WORKLOAD_PREFIX)
+        });
         self.users.retain(|name| name.starts_with(WORKLOAD_PREFIX));
-        self.consumer_groups
-            .retain(|(stream, _, _)| stream.starts_with(WORKLOAD_PREFIX));
+        self.consumer_groups.retain(|(stream, topic, group)| {
+            stream.starts_with(WORKLOAD_PREFIX)
+                && topic.starts_with(WORKLOAD_PREFIX)
+                && group.starts_with(WORKLOAD_PREFIX)
+        });
         self
     }
 }
@@ -208,28 +219,141 @@ pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
     report
 }
 
-/// Post-drain consensus checks that hold today.
+/// Step until every live replica's metadata plane is `Normal` in one shared
+/// view, or `max_ticks` elapses.
 ///
-/// Asserts no live replica is ahead of the leader, and (on a serial run) that
-/// the shadow equals the metadata committed on the leader. See the module docs
-/// for why full cross-replica equality is deferred.
+/// Needed before [`assert_converged`], which resolves the leader as "the live
+/// replica whose metadata consensus says it is primary". With primaries spared
+/// from crashes that was always the same replica in view 0. Once a primary can
+/// be crashed, live replicas transiently hold different views and there may be no
+/// `Normal` primary at all, so the leader lookup fails or names a deposed one --
+/// a false failure, not a divergence. Waiting for one view removes the ambiguity
+/// rather than guessing at a leader.
 ///
-/// Assumes one stable primary that every live replica agrees on: the leader is
-/// `Simulator::primary_index` (a single replica's view), and both checks treat
-/// it as the authoritative, most-advanced log. Sound today because the driver
-/// spares primaries from crashes, so no view change runs mid-test. Once
-/// primary-crash injection lands, live replicas can hold different views and
-/// this breaks: it may pick a stale or crashed leader (a correctly-ahead new
-/// primary then trips "exceeds leader"), or find no `Normal` primary mid-view
-/// change (`metadata_leader` returns `None`). Both are false failures. Fix
-/// then: resolve the leader by highest `(view, commit_offset)`, or quiesce
-/// until live replicas reconverge to one view before asserting. Crash injection
-/// already runs but spares primaries (`maybe_inject_crash`); this is deferred
-/// until primary-crash injection lands, itself gated on a request-resend path.
+/// Returns `false` if the views never converge, which is a real liveness failure
+/// and the caller should report it rather than assert against an unsettled
+/// cluster.
+#[must_use]
+pub fn settle_to_stable_view(sim: &mut Simulator, workload: &mut Workload, max_ticks: u64) -> bool {
+    for _ in 0..max_ticks {
+        if views_are_settled(sim, workload) {
+            return true;
+        }
+        workload.tick();
+        resubmit_due(sim, workload);
+        for reply in sim.step() {
+            let cmds = workload.on_reply(&reply);
+            apply_sim_commands(sim, &cmds);
+        }
+    }
+    views_are_settled(sim, workload)
+}
+
+/// Both planes settled: the metadata group and every tracked partition group.
+///
+/// The partition half matters for the leader-relative offset check in
+/// [`assert_converged`], which resolves its leader from `Simulator::primary_index`
+/// -- a single replica's view of that group's primary. Each partition group runs
+/// its own view change, so settling only the metadata plane leaves that check
+/// asserting against a deposed partition leader, and a correctly-ahead new one
+/// then trips "exceeds leader".
+fn views_are_settled(sim: &Simulator, workload: &Workload) -> bool {
+    if !metadata_view_is_settled(sim) {
+        return false;
+    }
+    workload
+        .options
+        .namespaces
+        .iter()
+        .all(|&ns| partition_view_is_settled(sim, ns))
+}
+
+/// True when every live replica's metadata consensus is `Normal` in the same
+/// view and exactly one of them claims to be primary.
+fn metadata_view_is_settled(sim: &Simulator) -> bool {
+    let mut view = None;
+    let mut primaries = 0usize;
+    let mut live = 0usize;
+    for replica_idx in 0..sim.replica_count {
+        if sim.is_crashed(replica_idx) {
+            continue;
+        }
+        let Some(consensus) = sim.replicas[usize::from(replica_idx)].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+        else {
+            continue;
+        };
+        live += 1;
+        if consensus.status() != Status::Normal {
+            return false;
+        }
+        match view {
+            Some(agreed) if agreed != consensus.view() => return false,
+            Some(_) => {}
+            None => view = Some(consensus.view()),
+        }
+        if consensus.is_primary() {
+            primaries += 1;
+        }
+    }
+    live > 0 && primaries == 1
+}
+
+/// True when every live replica hosting `ns` has that group `Normal` in one
+/// shared view with exactly one primary.
+///
+/// A replica that does not host the namespace is skipped rather than treated as
+/// disagreement: a group only materialises on its hash-owning shard, and after a
+/// restart a group whose stream the workload deleted is not re-materialised at
+/// all.
+fn partition_view_is_settled(sim: &Simulator, ns: server_common::sharding::IggyNamespace) -> bool {
+    let mut view = None;
+    let mut primaries = 0usize;
+    let mut hosts = 0usize;
+    for replica_idx in 0..sim.replica_count {
+        if sim.is_crashed(replica_idx) {
+            continue;
+        }
+        let Some(state) = sim.partition_consensus_state(usize::from(replica_idx), ns) else {
+            continue;
+        };
+        hosts += 1;
+        if state.status != Status::Normal {
+            return false;
+        }
+        match view {
+            Some(agreed) if agreed != state.view => return false,
+            Some(_) => {}
+            None => view = Some(state.view),
+        }
+        if state.is_primary {
+            primaries += 1;
+        }
+    }
+    // No live host is settled by default: there is no leader for the offset check
+    // to resolve either, and it skips the namespace for the same reason.
+    hosts == 0 || primaries == 1
+}
+
+/// Post-drain consensus checks.
+///
+/// Asserts no live replica is ahead of the leader, that every live replica agrees
+/// with every other on each committed metadata op they share, and (on a serial
+/// run) that the shadow equals the metadata committed on the leader.
+///
+/// Assumes one stable primary that every live replica agrees on, which
+/// [`settle_to_stable_view`] establishes and which callers should run first once
+/// primaries can be crashed. Without it this may pick a deposed leader (a
+/// correctly-ahead new primary then trips "exceeds leader") or find no `Normal`
+/// primary at all mid-view-change. Both are false failures.
 ///
 /// # Panics
-/// If a replica is ahead of the leader or the shadow mismatches the leader. The
-/// workload seed is in the message so the failing run replays deterministically.
+/// If a replica is ahead of the leader, two replicas disagree on a committed op,
+/// or the shadow mismatches the leader. The workload seed is in the message so the
+/// failing run replays deterministically.
 pub fn assert_converged(sim: &Simulator, workload: &Workload) {
     let seed = workload.options.seed;
     let live: Vec<usize> = (0..sim.replica_count)
@@ -241,25 +365,41 @@ pub fn assert_converged(sim: &Simulator, workload: &Workload) {
         "no live replicas at quiesce (seed={seed:#x})"
     );
 
-    // Safety direction: no live replica may be ahead of the leader on any
-    // namespace. A backup may trail (no idle catch-up yet, see module docs),
-    // but a backup whose commit_offset exceeds the leader's is a divergence.
+    // The consensus property proper: replicas compared against each other, not
+    // against the workload's expectations. Runs before the leader-relative checks
+    // because a genuine divergence explains any leader confusion below it.
+    state_checker::assert_committed_prefixes_agree(sim, seed);
+
+    // Safety direction: no live replica may have COMMITTED more of a group than
+    // its leader has. A backup may trail (no idle catch-up yet, see module docs),
+    // but a backup committed past the leader is a divergence.
+    //
+    // Measured on the group's consensus `commit_min`, not on
+    // `PartitionOffsets::commit_offset`. The latter is the highest durably
+    // persisted message offset, which counts an uncommitted suffix: a backup that
+    // persisted op N while the view that elected the new leader settled on N-1 is
+    // ordinary VSR, not divergence. That only stayed invisible while primaries
+    // were spared, since a never-crashed primary is always the furthest ahead;
+    // with primary crashes it fires on a correct cluster.
     for &ns in &workload.options.namespaces {
         let Some(leader) = sim.primary_index(ns) else {
             continue;
         };
-        let Some(leader_offset) = sim
-            .offsets(usize::from(leader), ns)
-            .map(|o| o.commit_offset)
+        let Some(leader_committed) = sim
+            .partition_consensus_state(usize::from(leader), ns)
+            .map(|state| state.commit_min)
         else {
             continue;
         };
         for &replica_idx in &live {
-            if let Some(offset) = sim.offsets(replica_idx, ns).map(|o| o.commit_offset) {
+            if let Some(committed) = sim
+                .partition_consensus_state(replica_idx, ns)
+                .map(|state| state.commit_min)
+            {
                 assert!(
-                    offset <= leader_offset,
-                    "replica {replica_idx} commit_offset {offset} exceeds leader {leader} \
-                     ({leader_offset}) on ns {ns:?} at quiesce (seed={seed:#x})",
+                    committed <= leader_committed,
+                    "replica {replica_idx} committed {committed} ops exceeds leader {leader} \
+                     ({leader_committed}) on ns {ns:?} at quiesce (seed={seed:#x})",
                 );
             }
         }

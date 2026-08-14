@@ -437,6 +437,15 @@ fn main() {
             "{}",
             oracle::quiesce_failure_report(&sim, &workload),
         );
+        // Then wait for one agreed view before asserting. `assert_converged`
+        // resolves the leader as whichever live replica claims to be primary, so
+        // asserting mid-view-change either finds none or finds a deposed one --
+        // false failures rather than divergences.
+        assert!(
+            oracle::settle_to_stable_view(&mut sim, &mut workload, 50_000),
+            "metadata views never converged after the drain\n{}",
+            oracle::quiesce_failure_report(&sim, &workload),
+        );
         oracle::assert_converged(&sim, &workload);
         println!("quiesced and converged (leader-relative + entity oracle)");
         // Again after the drain: the drain both answers outstanding requests and

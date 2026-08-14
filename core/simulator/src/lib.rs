@@ -141,6 +141,19 @@ impl SimReplica {
     }
 }
 
+/// One replica's view of a partition group's consensus. Read by the quiesce
+/// oracle; see [`Simulator::partition_consensus_state`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PartitionConsensusState {
+    pub status: consensus::Status,
+    pub view: u32,
+    pub is_primary: bool,
+    /// Ops this replica has committed in the group. The committed watermark, as
+    /// opposed to `PartitionOffsets::commit_offset`, which is the highest
+    /// durably PERSISTED message offset and so counts an uncommitted suffix too.
+    pub commit_min: u64,
+}
+
 pub struct Simulator {
     /// All replicas, indexed by replica id. Always fully populated — crashed
     /// replicas are kept alive but skipped during dispatch.
@@ -995,6 +1008,29 @@ impl Simulator {
         let shard = self.replicas[replica_idx].partition_shard(namespace);
         let partition = shard.plane.partitions().get_by_ns(&namespace)?;
         Some(u64::from(partition.consensus().view()))
+    }
+
+    /// One replica's view of a partition group's consensus, or `None` when that
+    /// replica does not host the namespace.
+    ///
+    /// Read by the quiesce oracle to decide whether a group has settled into one
+    /// view, which its leader-relative checks depend on once partition primaries
+    /// can be crashed.
+    #[must_use]
+    pub(crate) fn partition_consensus_state(
+        &self,
+        replica_idx: usize,
+        namespace: IggyNamespace,
+    ) -> Option<PartitionConsensusState> {
+        let shard = self.replicas[replica_idx].partition_shard(namespace);
+        let partition = shard.plane.partitions().get_by_ns(&namespace)?;
+        let consensus = partition.consensus();
+        Some(PartitionConsensusState {
+            status: consensus.status(),
+            view: consensus.view(),
+            is_primary: consensus.is_primary(),
+            commit_min: consensus.commit_min(),
+        })
     }
 
     /// Index of the current primary for `namespace`, as seen by the first live
@@ -3208,6 +3244,101 @@ mod tests {
     /// pipeline to `PIPELINE_PREPARE_QUEUE_MAX`; a request on `ns_b`
     /// still commits while `ns_a` is wedged (no quorum without backup
     /// acks); lifting the block drains `ns_a` completely.
+    /// The cross-replica equality check actually compares replicas against each
+    /// other, and holds over a metadata workload with crashes and restarts.
+    ///
+    /// Non-vacuity is the point of the assertions on the chain. An equality
+    /// oracle that never finds two replicas at the same op passes in silence, so
+    /// a green run would say nothing: `ops_compared` counts only ops witnessed on
+    /// more than one replica, which is the subset that exercised the property.
+    #[test]
+    fn committed_metadata_agrees_across_replicas() {
+        use crate::workload::{
+            self, FaultInjector, Workload,
+            invariants::Invariants,
+            options::{ActionWeights, WorkloadOptions},
+            oracle,
+        };
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 5;
+        let client_id: u128 = 1;
+        let seed = 0x57A7_E000;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+        sim.register_client_with_primary(&client);
+
+        // Metadata ops, since the committed chain this checks is the metadata WAL.
+        // Crash and restart so replicas rejoin and repair, which is when a
+        // divergence would be introduced if one could be.
+        let mut options = WorkloadOptions::new(seed, replica_count, vec![ns]);
+        options.weights = ActionWeights::metadata_only();
+        options.crash_per_tick_ratio = 0.01;
+        options.restart_per_tick_ratio = 0.02;
+        let mut wl = Workload::new(options);
+
+        let clients = [client];
+        let mut injector = FaultInjector::new(seed, replica_count);
+        let mut invariants = Invariants::new();
+        // Driven here rather than through `workload::run` so the accumulated
+        // chain is readable afterwards; `run` builds its own `Invariants`.
+        for _ in 0..4_000u32 {
+            wl.tick();
+            injector.step(&mut sim, &wl);
+            workload::resubmit_due(&mut sim, &mut wl);
+            if let Some((target, msg)) = wl.build_request(&clients[0]) {
+                sim.submit_request(clients[0].client_id(), target, msg.into_generic());
+            }
+            for reply in sim.step() {
+                let cmds = wl.on_reply(&reply);
+                workload::apply_sim_commands(&mut sim, &cmds);
+            }
+            invariants.check(&sim, &wl);
+        }
+
+        assert!(
+            injector.restarts() > 0,
+            "no replica restarted, so rejoin and repair never ran"
+        );
+        let chain = invariants.state_checker();
+        assert!(
+            chain.chain_len() > 0,
+            "the canonical commit chain is empty: nothing was ever recorded"
+        );
+        assert!(
+            chain.ops_compared() > 0,
+            "no committed op was witnessed on two replicas, so the equality check \
+             never actually compared anything and would pass on a diverged cluster"
+        );
+
+        assert!(
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 50_000),
+            "{}",
+            oracle::quiesce_failure_report(&sim, &wl),
+        );
+        assert!(
+            oracle::settle_to_stable_view(&mut sim, &mut wl, 50_000),
+            "metadata views never converged after the drain"
+        );
+        oracle::assert_converged(&sim, &wl);
+    }
+
     /// A restarted replica comes back with the partition data it had, so its
     /// `commit_offset` does not regress.
     ///
