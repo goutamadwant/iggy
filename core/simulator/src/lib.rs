@@ -38,7 +38,9 @@ use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use metadata::impls::metadata::StreamsFrontend;
 use network::Network;
 use packet::{PacketSimulatorOptions, ProcessId};
-use partitions::{Partition, PartitionOffsets, PollFragments, PollingArgs, PollingConsumer};
+use partitions::{
+    Partition, PartitionOffsets, PollFragments, PollingArgs, PollingConsumer, RetainedPartitionLog,
+};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256Plus;
 use rand_xoshiro::rand_core::SeedableRng;
@@ -106,6 +108,16 @@ pub struct SimReplica {
     /// leaves the gate, its write-failure fence, and view recovery all
     /// unexercised.
     pub partition_superblocks: RefCell<HashMap<IggyNamespace, Rc<SimSuperblock>>>,
+    /// One retained message log per partition group, with the offsets recovered
+    /// from it. Harness-owned for the same reason as `metadata_journal`: a
+    /// restart drops and rebuilds the partition, and a real server loses nothing
+    /// there because its messages are in segment files that boot recovers the
+    /// offset counter from. The simulator has no segment files, so without this
+    /// the rebuilt partition comes back empty, `commit_offset` regresses to zero,
+    /// and the monotonicity invariant reports a discarded log as a consensus
+    /// regression. Populated on the way into a restart (see
+    /// [`Simulator::replica_restart`]) and consumed by `materialise_partition`.
+    partition_logs: RefCell<HashMap<IggyNamespace, (RetainedPartitionLog, u64, u64)>>,
     /// Keeps each pump's stop channel alive; dropping one would end that
     /// pump gracefully, which is reserved for future shutdown/restart
     /// tests (crash uses `DetExecutor::abort` instead).
@@ -347,6 +359,7 @@ impl Simulator {
                 metadata_journal,
                 metadata_incarnation,
                 partition_superblocks: RefCell::new(HashMap::new()),
+                partition_logs: RefCell::new(HashMap::new()),
                 _stop_txs: stop_txs,
                 pump_tasks,
             });
@@ -771,6 +784,12 @@ impl Simulator {
         // as a rebooted server partition reads the record in its directory.
         let partition_superblocks =
             std::mem::take(&mut *self.replicas[idx].partition_superblocks.borrow_mut());
+        // Take each live partition's log while its shard is still standing. This
+        // is the harness playing the storage layer: a real server's messages are
+        // in segment files and its boot recovers the offset counter from them, so
+        // a partition rebuilt with nothing would model total data loss rather than
+        // a restart. Read before the rebuild because the rebuild drops the shards.
+        let partition_logs = self.retain_partition_logs(idx, &partition_superblocks);
 
         // Recover the durable VSR state from the retained superblock before the
         // rebuild, as production reads it in restore_metadata_consensus.
@@ -834,6 +853,7 @@ impl Simulator {
             metadata_journal,
             metadata_incarnation,
             partition_superblocks: RefCell::new(partition_superblocks),
+            partition_logs: RefCell::new(partition_logs),
             _stop_txs: stop_txs,
             pump_tasks,
         };
@@ -861,6 +881,42 @@ impl Simulator {
         self.network
             .process_enable(ProcessId::Replica(replica_index));
         self.crashed.remove(&replica_index);
+    }
+
+    /// Take the message log out of every partition this replica has
+    /// materialised, together with the offsets recovered from it.
+    ///
+    /// Called while the outgoing shards are still alive, so this is the last
+    /// point the data can be read. `std::mem::take` leaves the doomed partition
+    /// with an empty log, which nothing observes: the shard it belongs to is
+    /// dropped moments later.
+    ///
+    /// Keyed off `partition_superblocks` rather than the live partitions map
+    /// because that is already the record of which groups this replica has
+    /// materialised, and it is what the restart re-materialises from.
+    fn retain_partition_logs(
+        &self,
+        replica_idx: usize,
+        materialised: &HashMap<IggyNamespace, Rc<SimSuperblock>>,
+    ) -> HashMap<IggyNamespace, (RetainedPartitionLog, u64, u64)> {
+        let replica = &self.replicas[replica_idx];
+        let mut retained = HashMap::with_capacity(materialised.len());
+        for &namespace in materialised.keys() {
+            let partitions = replica.partition_shard(namespace).plane.partitions();
+            let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
+                continue;
+            };
+            let offsets = partition.offsets();
+            retained.insert(
+                namespace,
+                (
+                    std::mem::take(&mut partition.log),
+                    offsets.commit_offset,
+                    offsets.write_offset,
+                ),
+            );
+        }
+        retained
     }
 
     /// Advance consensus timeouts on every live replica without a full
@@ -988,7 +1044,17 @@ fn materialise_partition(replica: &SimReplica, namespace: IggyNamespace) {
     let recovered_state = superblock
         .read_latest_sync()
         .and_then(|bytes| VsrState::try_from(bytes.as_slice()).ok());
-    replica.shards[usize::from(owner)].init_partition(namespace, Some(superblock), recovered_state);
+    // Hand back the log this group left behind, if it has been materialised
+    // before on this replica. Removed rather than cloned: the rebuilt partition
+    // becomes its sole owner, and a second materialisation without a restart in
+    // between would otherwise resurrect a log the live partition has moved past.
+    let retained = replica.partition_logs.borrow_mut().remove(&namespace);
+    replica.shards[usize::from(owner)].init_partition(
+        namespace,
+        Some(superblock),
+        recovered_state,
+        retained,
+    );
     // Commit the namespace before stamping the rows: a partition the metadata
     // plane never heard of is a shape production cannot produce, and the shard
     // refuses to serve client traffic whose routing-row epoch it cannot match
@@ -2984,7 +3050,7 @@ mod tests {
             executor.run_until_stalled(POLL_BUDGET); // borrow acquired; task parks
             let grow = Rc::clone(&sim.replicas[0].shards[0]);
             executor.spawn(async move {
-                grow.init_partition(ns_grow, None, None);
+                grow.init_partition(ns_grow, None, None, None);
             });
             executor.run_until_stalled(POLL_BUDGET); // grow while the borrow is live
         }))
@@ -3019,7 +3085,7 @@ mod tests {
         executor.run_until_stalled(POLL_BUDGET);
         let grow = Rc::clone(&sim.replicas[0].shards[0]);
         executor.spawn(async move {
-            grow.init_partition(ns_grow, None, None);
+            grow.init_partition(ns_grow, None, None, None);
         });
         executor.run_until_stalled(POLL_BUDGET);
 
@@ -3135,6 +3201,98 @@ mod tests {
     /// pipeline to `PIPELINE_PREPARE_QUEUE_MAX`; a request on `ns_b`
     /// still commits while `ns_a` is wedged (no quorum without backup
     /// acks); lifting the block drains `ns_a` completely.
+    /// A restarted replica comes back with the partition data it had, so its
+    /// `commit_offset` does not regress.
+    ///
+    /// The simulator has no segment files, so the log has to be carried across
+    /// the rebuild by hand (`retain_partition_logs` into
+    /// `IggyPartition::adopt_retained_log`). Without that the rebuilt partition
+    /// is empty and reports `commit_offset` 0, which models total data loss
+    /// rather than a restart and trips the monotonicity invariant on a harness
+    /// artefact. Asserted on a backup, which is where the driver's crash
+    /// injection puts a restart.
+    #[test]
+    fn restarted_replica_keeps_its_partition_offsets() {
+        use bytes::Bytes;
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0x5EED_0079,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+        sim.register_client_with_primary(&client);
+
+        // Enough committed writes that an empty rebuild is unmistakable.
+        for sequence in 0..8u32 {
+            let msg = client.send_messages(ns, &[Bytes::from(format!("retained-{sequence}"))]);
+            sim.submit_request(client_id, 0, msg.into_generic());
+            for _ in 0..40 {
+                sim.step();
+            }
+        }
+
+        let backup = 1usize;
+        let before = sim
+            .offsets(backup, ns)
+            .expect("backup hosts the namespace")
+            .commit_offset;
+        assert!(
+            before > 0,
+            "backup must have committed some writes before the restart, else a \
+             rebuilt-empty partition would be indistinguishable from this state"
+        );
+
+        sim.replica_crash(u8::try_from(backup).expect("replica index fits u8"));
+        for _ in 0..50 {
+            sim.tick();
+        }
+        sim.replica_restart(u8::try_from(backup).expect("replica index fits u8"));
+
+        let after = sim
+            .offsets(backup, ns)
+            .expect("namespace re-materialised on restart")
+            .commit_offset;
+        assert_eq!(
+            after, before,
+            "restarted backup lost its partition offsets: the retained log did not \
+             carry across the rebuild"
+        );
+
+        // The data itself, not just the counter: a carried-over counter with an
+        // empty log would satisfy the assert above and still have lost every
+        // message.
+        let fragments = sim
+            .poll_messages(
+                backup,
+                ns,
+                PollingConsumer::Consumer(0, 0),
+                &PollingArgs::new(iggy_common::PollingStrategy::offset(0), 16, false),
+            )
+            .expect("poll against the re-materialised partition");
+        assert!(
+            !fragments.is_empty(),
+            "restarted backup served no messages: the offset counter came across \
+             but the log behind it did not"
+        );
+    }
+
     /// A lost `PrepareOk` does not wedge the metadata plane: once the acks flow
     /// again the primary reaches its commit quorum without client involvement.
     ///

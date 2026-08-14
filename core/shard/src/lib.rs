@@ -3424,12 +3424,21 @@ where
     /// `recovered_state` is that store's last record, read by the caller (the
     /// store's read is async and this is not), mirroring how `new_shard` takes the
     /// metadata plane's.
+    ///
+    /// `retained` is the log a previous incarnation of this group left behind,
+    /// standing in for the segments a real boot recovers from. `None` builds an
+    /// empty partition, which is right for a first materialisation and wrong for a
+    /// restart: a rebuilt partition with no data reports `commit_offset` 0 and
+    /// looks like a regression rather than a harness that discarded the log. The
+    /// recovered offsets ride along because the caller plays the storage layer
+    /// here, exactly as it does for the metadata WAL.
     #[cfg(any(test, feature = "simulator"))]
     pub fn init_partition(
         &self,
         namespace: IggyNamespace,
         superblock: Option<Rc<SB>>,
         recovered_state: Option<consensus::VsrState>,
+        retained: Option<(partitions::RetainedPartitionLog, u64, u64)>,
     ) where
         B: MessageBus + Clone,
     {
@@ -3465,6 +3474,15 @@ where
         );
         if let Some(superblock) = superblock {
             partition.set_superblock(superblock, recovered_state.as_ref());
+        }
+        // Retained log before the frontier restore, so the restore maxes against
+        // the offsets the log actually proved rather than the zeroes of an empty
+        // one. Both are max rules, so the order only decides which value each sees
+        // first, never the outcome; doing it in this order keeps the frontier
+        // restore's own precondition (`should_increment_offset` already set by a
+        // recovered offset space) meaningful.
+        if let Some((log, durable_offset, write_offset)) = retained {
+            partition.adopt_retained_log(log, durable_offset, write_offset);
         }
         // The SAME call the boot paths make, not a copy of it: this restore is
         // a max against what the segments already proved, and a harness running

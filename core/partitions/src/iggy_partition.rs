@@ -752,6 +752,51 @@ where
     /// simulator share one implementation. A copy in the harness was a copy of
     /// the max rule that had lost the max, in the one place built to catch
     /// violations of it.
+    /// Adopt a log carried over from a previous incarnation of this partition,
+    /// standing in for what segment recovery reads off disk at boot.
+    ///
+    /// A restart drops the whole partition and rebuilds it, which on a real
+    /// server loses nothing: the messages are in segment files and boot recovers
+    /// the offset counter from them. The simulator's partitions are in-memory, so
+    /// without this the rebuilt partition comes back empty and its
+    /// `commit_offset` regresses to zero -- reported as a consensus regression
+    /// when it is really the harness having thrown the data away.
+    ///
+    /// `durable_offset` and `write_offset` are what the caller recovered, exactly
+    /// as `segment_recovery` derives them from the segments it read. Applied as a
+    /// MAX against whatever the superblock frontier already proved, never as an
+    /// overwrite, for the same reason [`Self::restore_offset_frontier`] maxes: a
+    /// recovered value that is behind the frontier must not lower it.
+    ///
+    /// Lives here rather than in the harness so the rule is stated once, beside
+    /// the frontier restore it has to agree with.
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn adopt_retained_log(
+        &mut self,
+        log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>, PartitionJournalMemStorage>,
+        durable_offset: u64,
+        write_offset: u64,
+    ) {
+        self.log = log;
+        // Empty carry-over: the previous incarnation never took a write, so there
+        // is no offset space to restore and claiming one would make the next
+        // prepare mint from a base no peer agrees on.
+        if write_offset == 0 && durable_offset == 0 && !self.should_increment_offset {
+            return;
+        }
+        let durable = durable_offset.max(self.offset.load(Ordering::Acquire));
+        let dirty = write_offset
+            .max(durable)
+            .max(self.dirty_offset.load(Ordering::Relaxed));
+        self.offset.store(durable, Ordering::Release);
+        self.dirty_offset.store(dirty, Ordering::Relaxed);
+        self.should_increment_offset = true;
+        // Everything carried over is already persisted as far as this replica is
+        // concerned, so the flush and commit paths must not re-persist or re-count
+        // it -- the same contract boot gives a partition recovered from segments.
+        self.recovered_durable_offset = Some(durable);
+    }
+
     pub fn restore_offset_frontier(&mut self, recovered: Option<&consensus::VsrState>) {
         let Some(frontier) = recovered
             .map(|state| state.offset_frontier)

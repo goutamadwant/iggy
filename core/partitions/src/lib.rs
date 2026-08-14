@@ -38,6 +38,19 @@ pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
 pub use iggy_partition::{IggyPartition, PurgeError};
 pub use iggy_partitions::IggyPartitions;
+
+/// A partition's message log, named so a caller can carry one across a rebuild.
+///
+/// Exists for the simulator, which has no segment files to recover from and so
+/// must hold the log itself for a restarted replica to come back with its data
+/// (see [`IggyPartition::adopt_retained_log`]). The generic parameters are the
+/// only pair `IggyPartition::log` is ever instantiated with, so this names the
+/// concrete type rather than widening anything.
+#[cfg(any(test, feature = "simulator"))]
+pub type RetainedPartitionLog = log::SegmentedLog<
+    journal::PartitionJournal<journal::PartitionJournalMemStorage>,
+    journal::PartitionJournalMemStorage,
+>;
 pub use journal::{EVICTED_RING_BYTES_MAX, EVICTED_RING_CAPACITY};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;

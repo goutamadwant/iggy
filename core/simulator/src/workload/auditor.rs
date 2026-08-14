@@ -183,7 +183,6 @@ impl ServerAuditor {
         &self.stats
     }
 
-    #[must_use]
     /// The action of an outstanding request, if one is recorded for `key`.
     /// Diagnostic only: names what a stalled run is waiting on, which the bare
     /// `(client, request)` pair cannot.
