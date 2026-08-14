@@ -315,6 +315,23 @@ impl Workload {
             OnReply::Unknown => return Vec::new(),
         };
 
+        // A pre-commit denial short-circuits everything below. `ReplyHeader`'s
+        // contract makes the two channels mutually exclusive: a reply either
+        // commits (status 0, result section present) or is denied before commit
+        // (status set, EMPTY body). Reading a result section off a denial finds
+        // no bytes, which the metadata branch below would report as a corrupt
+        // reply.
+        //
+        // The op never entered the log, so the shadow must not move and there is
+        // nothing to classify. Only the dispatch shell produces these, since
+        // authorization runs there; the raw path has no denial site at all, which
+        // is why this went unmodelled until the workload ran through the shell.
+        if header.status != 0 {
+            self.auditor.note_denial(entry.action, header.status);
+            self.release_outstanding(key);
+            return Vec::new();
+        }
+
         // Decode the committed result code. Metadata replies carry a
         // result section (see `ApplyReply::to_reply_body`); partition-plane
         // replies do not, hence the `is_metadata` gate.
@@ -524,6 +541,7 @@ pub fn run_with_faults(
             apply_sim_commands(sim, &cmds);
             replies_seen += 1;
         }
+        assert_no_evictions(sim);
         invariants.check(sim, workload);
         if replies_seen >= replies_target {
             break;
@@ -667,6 +685,32 @@ impl FaultInjector {
         self.now
             .saturating_sub(self.last_transition[usize::from(replica_idx)])
     }
+}
+
+/// Fail loudly if the cluster evicted a client, which the workload cannot yet
+/// survive.
+///
+/// An eviction ends the session: the client's outstanding requests become
+/// unanswerable and it must log in again before submitting anything. Modelling
+/// that means re-establishing the session mid-run and discarding the auditor's
+/// expectations for it, which the driver does not do. Until it does, an eviction
+/// presents as a client that has silently stopped making progress, so name it
+/// here rather than let the run time out with no explanation.
+///
+/// Only reachable through the dispatch shell, and in practice only once crashes
+/// and restarts are also in play.
+///
+/// # Panics
+/// If any client was evicted since the last step.
+fn assert_no_evictions(sim: &mut Simulator) {
+    let evicted = sim.take_evictions();
+    assert!(
+        evicted.is_empty(),
+        "cluster evicted client(s) {evicted:?}: their sessions are gone, so their \
+         outstanding requests can never be answered and their next request is \
+         refused. The workload does not re-establish a session, so the run cannot \
+         continue"
+    );
 }
 
 /// Submit every request whose reply is overdue (see [`Workload::due_resends`]).

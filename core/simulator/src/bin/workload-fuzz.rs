@@ -82,6 +82,12 @@ struct Args {
     /// Crash the primary too, putting a view change under live traffic.
     #[arg(long)]
     crash_primary: bool,
+    /// Route every client request through the server's real dispatch handlers
+    /// instead of the raw `on_message` fast path. Clients then log in against the
+    /// seeded root user and carry a bound session, so the run also covers
+    /// authorization and session lifecycle, which exist only on this path.
+    #[arg(long)]
+    shell: bool,
     #[arg(long)]
     no_quiesce: bool,
 
@@ -356,8 +362,8 @@ fn main() {
     let network_opts = network_options(&args, replicas, clients, seed);
     println!(
         "workload-fuzz: seed={seed} ticks={ticks} clients={clients} replicas={replicas} \
-         plane={plane:?} faults={:?} crash_prob={crash_prob} quiesce={quiesce}",
-        args.faults,
+         plane={plane:?} faults={:?} shell={} crash_prob={crash_prob} quiesce={quiesce}",
+        args.faults, args.shell,
     );
     println!(
         "network: loss={} replay={} delay={}..{} partition={:?}/{:?} \
@@ -383,17 +389,38 @@ fn main() {
     });
 
     let client_ids: Vec<u128> = (1..=u128::from(clients)).collect();
-    let mut sim = Simulator::new(
-        usize::from(replicas),
-        client_ids.iter().copied(),
-        network_opts,
-    );
+    let mut sim = if args.shell {
+        Simulator::with_shards_shell(
+            usize::from(replicas),
+            1,
+            client_ids.iter().copied(),
+            network_opts,
+        )
+    } else {
+        Simulator::new(
+            usize::from(replicas),
+            client_ids.iter().copied(),
+            network_opts,
+        )
+    };
     let sim_clients: Vec<SimClient> = client_ids.iter().map(|&id| SimClient::new(id)).collect();
 
     let ns = IggyNamespace::new(1, 1, 0);
     sim.init_partition(ns);
+    if args.shell {
+        // The shell resolves a partition request's namespace against committed
+        // metadata, so the stream and topic behind it have to exist as well as the
+        // partition group.
+        sim.seed_stream_topic_partition(ns);
+    }
     for client in &sim_clients {
-        sim.register_client_with_primary(client);
+        if args.shell {
+            // Log in rather than bare-register: the dispatch path admits a request
+            // only from a bound session, and the login is what mints one.
+            sim.shell_login(client);
+        } else {
+            sim.register_client_with_primary(client);
+        }
     }
 
     let mut options = WorkloadOptions::new(seed, replicas, vec![ns]);
@@ -461,17 +488,19 @@ fn print_coverage(workload: &Workload) {
     let stats = workload.auditor.stats();
     println!(
         "coverage: replies_seen={} replies_unknown={} committed_rejections={} \
-         samples_none={} resends={}",
+         samples_none={} resends={} denials={}",
         stats.replies_seen,
         stats.replies_unknown,
         stats.committed_rejections,
         workload.samples_none(),
         workload.resends(),
+        stats.denials,
     );
     for action in Action::iter() {
         let commits = stats.commits(action);
-        if commits > 0 {
-            println!("  {action:?}: {commits} commits");
+        let (denied, status) = stats.denials_per_action[action as usize];
+        if commits > 0 || denied > 0 {
+            println!("  {action:?}: {commits} commits, {denied} denied (last status {status})");
         }
     }
 }

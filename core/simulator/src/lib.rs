@@ -32,7 +32,7 @@ use deps::SimClock;
 use deps::SimSuperblock;
 use deps::{MemStorage, SimJournal};
 use executor::{DetExecutor, RunOutcome, TaskId};
-use iggy_binary_protocol::{GenericHeader, ReplyHeader};
+use iggy_binary_protocol::{Command2, GenericHeader, ReplyHeader};
 use iggy_common::IggyError;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use metadata::impls::metadata::StreamsFrontend;
@@ -176,6 +176,14 @@ pub struct Simulator {
     entry_rng: Xoshiro256Plus,
     /// Network seed, kept for livelock diagnostics.
     seed: u64,
+    /// Clients the cluster has evicted since the last drain, in delivery order.
+    ///
+    /// An eviction ends a session: every request that client has outstanding will
+    /// never be answered, and it must log in again before it can submit anything.
+    /// Recorded rather than acted on here, because re-establishing a session needs
+    /// to step the simulator and drop the workload's expectations for that client,
+    /// neither of which belongs inside packet delivery.
+    evicted: Vec<u128>,
     /// Dispatch-shell mode: when set, inbound client packets are delivered
     /// through the real `on_client_request` handler (see
     /// [`shard::IggyShard::deliver_client_request`]) instead of the raw
@@ -388,6 +396,7 @@ impl Simulator {
             client_ids,
             executor,
             entry_rng: Xoshiro256Plus::seed_from_u64(seed ^ ENTRY_SHARD_SEED_SALT),
+            evicted: Vec::new(),
             seed,
             shell,
         }
@@ -564,7 +573,17 @@ impl Simulator {
                     }
                     // Crashed or missing: packet silently dropped.
                 }
-                ProcessId::Client(_) => {
+                ProcessId::Client(client_id) => {
+                    // Not every client-addressed frame is a reply. `Eviction`
+                    // tells a client its session is gone, which the server sends
+                    // once the client table drops it -- reachable as soon as the
+                    // dispatch shell runs with crashes and restarts. Decoding it
+                    // as a reply fails on the command discriminant, so classify
+                    // first and record the eviction for the driver.
+                    if packet.message.header().command == Command2::Eviction {
+                        self.evicted.push(client_id);
+                        continue;
+                    }
                     let reply: Message<ReplyHeader> = packet
                         .message
                         .deep_copy()
@@ -607,6 +626,15 @@ impl Simulator {
         self.network.tick();
 
         client_replies
+    }
+
+    /// Take the clients evicted since the last call.
+    ///
+    /// A driver must consume these: an evicted client's session is gone, so its
+    /// outstanding requests are unanswerable and its next request is refused
+    /// until it logs in again. Ignoring them looks exactly like a wedge.
+    pub fn take_evictions(&mut self) -> Vec<u128> {
+        std::mem::take(&mut self.evicted)
     }
 
     /// Rolling hash of the executor schedule (every poll and timer fire).
@@ -3244,6 +3272,86 @@ mod tests {
     /// pipeline to `PIPELINE_PREPARE_QUEUE_MAX`; a request on `ns_b`
     /// still commits while `ns_a` is wedged (no quorum without backup
     /// acks); lifting the block drains `ns_a` completely.
+    /// The workload drains and converges when every request goes through the
+    /// server's real dispatch handlers rather than the raw `on_message` path.
+    ///
+    /// Worth its own test because the shell path is where authorization, session
+    /// binding and the pre-commit deny replies live; the raw path has no deny site
+    /// at all. Running the workload here is the only thing that exercises them,
+    /// and it is what surfaced that the workload had never modelled a denial:
+    /// `ReplyHeader::status` nonzero means an empty body, and the reply decoder
+    /// was reading a result section off it and calling the reply corrupt.
+    ///
+    /// Asserts denials were actually observed, so the test cannot pass by taking
+    /// a path where nothing is ever denied and thus proving nothing about the
+    /// shell.
+    #[test]
+    fn shell_workload_drains_and_converges() {
+        use crate::workload::{
+            self, Workload,
+            options::{ActionWeights, WorkloadOptions},
+            oracle,
+        };
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let seed = 0x5E11_0001;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::with_shards_shell(
+            usize::from(replica_count),
+            1,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+        // The dispatch path resolves a partition request's namespace against
+        // committed metadata, so the stream and topic have to exist too.
+        sim.seed_stream_topic_partition(ns);
+
+        let client = SimClient::new(client_id);
+        // Log in rather than bare-register: dispatch admits a request only from a
+        // bound session.
+        sim.shell_login(&client);
+
+        let mut options = WorkloadOptions::new(seed, replica_count, vec![ns]);
+        options.weights = ActionWeights::uniform();
+        let mut wl = Workload::new(options);
+
+        let clients = [client];
+        let replies = workload::run(&mut sim, &mut wl, &clients, 4_000, u64::MAX);
+        assert!(replies > 0, "shell workload produced no replies");
+
+        let stats = wl.auditor.stats();
+        assert!(
+            stats.commits_per_action.iter().sum::<u64>() > 0,
+            "shell workload committed nothing, so the dispatch path never got past \
+             admission"
+        );
+        assert!(
+            stats.denials > 0,
+            "no request was denied, so the pre-commit deny path this test exists to \
+             cover never ran"
+        );
+
+        assert!(
+            oracle::drive_to_quiesce(&mut sim, &mut wl, 20_000),
+            "{}",
+            oracle::quiesce_failure_report(&sim, &wl),
+        );
+        oracle::assert_converged(&sim, &wl);
+    }
+
     /// The cross-replica equality check actually compares replicas against each
     /// other, and holds over a metadata workload with crashes and restarts.
     ///

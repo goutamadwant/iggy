@@ -58,6 +58,22 @@ pub struct AuditorStats {
     /// rejection). The shadow does not mutate on these; in a serial run the
     /// `on_reply` equality oracle asserts the rejection was the targeted outcome.
     pub committed_rejections: u64,
+    /// Replies denied before commit, carrying `ReplyHeader::status` and an empty
+    /// body. Distinct from a committed rejection: the op never entered the log,
+    /// so the shadow must not move and no result section exists to classify.
+    /// Only the dispatch shell produces these (authorization runs there); the raw
+    /// path never denies.
+    pub denials: u64,
+    /// Per-action denial counter and the last status seen for it, indexed by
+    /// `Action as usize`.
+    ///
+    /// Per-action rather than a single total because the two causes need telling
+    /// apart: an op the server legitimately refuses for this input (an offset the
+    /// partition cannot accept yet) versus an op the dispatch layer cannot decode
+    /// at all, which means the workload builds a wire shape the real path rejects.
+    /// The second is a workload bug and shows up as every request for that action
+    /// being denied with the same status.
+    pub denials_per_action: [(u64, u32); Action::COUNT],
 }
 
 impl Default for AuditorStats {
@@ -67,6 +83,8 @@ impl Default for AuditorStats {
             replies_unknown: 0,
             commits_per_action: [0u64; Action::COUNT],
             committed_rejections: 0,
+            denials: 0,
+            denials_per_action: [(0, 0); Action::COUNT],
         }
     }
 }
@@ -174,6 +192,14 @@ impl ServerAuditor {
     /// Record a committed business rejection (nonzero result code). Either
     /// targeted by outcome-first generation (duplicate name, fabricated missing
     /// entity) or produced by a race.
+    /// Record a pre-commit denial (`ReplyHeader::status` nonzero).
+    pub const fn note_denial(&mut self, action: Action, status: u32) {
+        self.stats.denials += 1;
+        let entry = &mut self.stats.denials_per_action[action as usize];
+        entry.0 += 1;
+        entry.1 = status;
+    }
+
     pub const fn note_committed_rejection(&mut self) {
         self.stats.committed_rejections += 1;
     }
