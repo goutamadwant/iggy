@@ -25,6 +25,7 @@ use server_common::sharding::IggyNamespace;
 
 use crate::client::SimClient;
 use crate::workload::effect::Effect;
+use crate::workload::ops::sample_consumer_kind;
 use crate::workload::options::WorkloadOptions;
 use crate::workload::shadow::Shadow;
 
@@ -52,7 +53,7 @@ pub fn sample(
     match outcome {
         Outcome::Success => {
             let ns = shadow.pick_namespace(prng)?;
-            let consumer_kind: u8 = u8::from(prng.random::<bool>());
+            let consumer_kind = sample_consumer_kind(prng);
             let consumer_id: u32 = prng.random_range(0..options.consumer_pool_size.max(1));
             let f: f32 = prng.random();
             let ack = if f < options.ack_quorum_ratio {

@@ -1675,8 +1675,15 @@ mod tests {
         // Re-locked again when replies stopped echoing a group id (the
         // client wire lost its namespace field): the reply-hash tuple
         // dropped that component.
+        // Re-locked again when the consumer-offset ops began drawing the WIRE
+        // consumer kind (1 / 2) instead of a bare boolean (0 / 1). Kind 0 is
+        // not a `WireConsumer` discriminant, so every such request used to be
+        // dropped unparsed with no reply, wedging the client's only in-flight
+        // slot; the previous baseline was recorded over a trace that stalled a
+        // few replies in. Same single bool draw, so only the encoded bytes and
+        // the replies they now earn moved. See `ops::sample_consumer_kind`.
         assert_eq!(
-            h1, 0xCF1F_BC79_B44A_65F7,
+            h1, 0x25C7_0F6A_5D0F_A8B2,
             "workload reply hash drifted from locked baseline"
         );
     }
