@@ -27,6 +27,16 @@ use strum::EnumCount;
 /// a crashed primary is retried long before the run's budget runs out.
 pub const DEFAULT_REQUEST_TIMEOUT_TICKS: u64 = 200;
 
+/// Default [`WorkloadOptions::crash_stability_ticks`]. Long enough that the
+/// surviving primary commits past the crashed replica's log, so its rejoin has
+/// something to repair.
+pub const DEFAULT_CRASH_STABILITY_TICKS: u64 = 300;
+
+/// Default [`WorkloadOptions::restart_stability_ticks`]. Long enough for a
+/// rejoined replica to finish catching up before it becomes a crash candidate
+/// again, so a run does not consist entirely of half-repaired replicas.
+pub const DEFAULT_RESTART_STABILITY_TICKS: u64 = 500;
+
 /// Per-action sampling weights as percentages. Unlisted variants default
 /// to 0 (never picked). Listed weights must sum to 100.
 #[derive(Debug, Clone, Copy)]
@@ -172,10 +182,29 @@ pub struct WorkloadOptions {
     pub consumer_pool_size: u32,
     /// Upper bound on offset carried by `StoreConsumerOffset2`.
     pub max_offset: u64,
-    /// Probability per tick that the driver crashes one live non-primary
-    /// replica (crash-only, no restart). `0.0` disables injection: the fault
-    /// PRNG draws nothing, so traffic stays bit-identical.
+    /// Probability per tick that the driver crashes one eligible replica.
+    /// `0.0` disables injection entirely: the fault PRNG draws nothing, so
+    /// traffic stays bit-identical.
     pub crash_per_tick_ratio: f32,
+    /// Probability per tick that the driver restarts one crashed replica.
+    /// Meaningless without `crash_per_tick_ratio`, since nothing is ever down.
+    pub restart_per_tick_ratio: f32,
+    /// Ticks a replica must stay down before it may be restarted. Keeps a crash
+    /// long enough to actually matter: a replica restarted the tick after it
+    /// crashed never falls behind, so nothing needs repairing.
+    pub crash_stability_ticks: u64,
+    /// Ticks a replica must stay up before it may be crashed again. Stops a
+    /// single unlucky replica from being crash-looped while its peers never
+    /// fail.
+    pub restart_stability_ticks: u64,
+    /// Leave the primary of every tracked namespace out of the crash pool.
+    ///
+    /// Defaults to `true`, which is what the driver did unconditionally before
+    /// clients could resend: a request lost to a crashed primary was never
+    /// retried, so it stranded the client's only in-flight slot. With resending
+    /// in place, setting this to `false` is what puts a view change under live
+    /// traffic, the scenario the harness exists for.
+    pub spare_primary: bool,
     /// Floor on live replicas the driver will not crash below, preserving a
     /// commit quorum. Defaults to `replica_count / 2 + 1`.
     pub min_survivors: u8,
@@ -206,6 +235,10 @@ impl WorkloadOptions {
             consumer_pool_size: 4,
             max_offset: 1_000_000,
             crash_per_tick_ratio: 0.0,
+            restart_per_tick_ratio: 0.0,
+            crash_stability_ticks: DEFAULT_CRASH_STABILITY_TICKS,
+            restart_stability_ticks: DEFAULT_RESTART_STABILITY_TICKS,
+            spare_primary: true,
             min_survivors: replica_count / 2 + 1,
             request_timeout_ticks: DEFAULT_REQUEST_TIMEOUT_TICKS,
         }

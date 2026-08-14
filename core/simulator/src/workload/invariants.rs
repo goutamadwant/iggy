@@ -51,8 +51,20 @@ impl Invariants {
     /// Globally:
     /// - total in-flight requests stay within the per-client queue ceiling.
     ///
-    /// Crashed replicas are skipped: their last-seen marks are retained, which
-    /// stays correct because both quantities are monotonic across a restart.
+    /// Crashed replicas are skipped and their last-seen marks retained, which is
+    /// correct for `view` (the superblock carries it across a restart) but NOT
+    /// for partition `commit_offset`, because the simulator does not retain
+    /// partition data across a restart the way it retains the metadata WAL and
+    /// the superblocks. `IggyPartitions` is dropped and rebuilt empty, so a
+    /// restarted replica reports `commit_offset` 0 and this trips, reporting a
+    /// harness limitation as a consensus regression.
+    ///
+    /// So restart injection (`WorkloadOptions::restart_per_tick_ratio`) is
+    /// metadata-plane only today. Driving it with partition traffic needs the
+    /// partition journal held by the harness, per-namespace, exactly as
+    /// `SimReplica::metadata_journal` already is; a real server's segments are on
+    /// disk and do survive, so retaining them is the faithful model, and the
+    /// alternative of relaxing this check would instead model total data loss.
     ///
     /// # Panics
     /// On any regression or in-flight overflow. The workload seed is in the

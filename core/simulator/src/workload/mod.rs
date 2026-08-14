@@ -188,14 +188,23 @@ impl Workload {
         due
     }
 
-    /// Outstanding requests as `(client, request, target, attempts)`, in key
-    /// order. Diagnostic only: names what a run was still waiting on when it
-    /// failed to drain.
+    /// Outstanding requests as `(client, request, action, target, attempts)`, in
+    /// key order. Diagnostic only: names what a run was still waiting on when it
+    /// failed to drain, including which op, since some ops cannot be answered
+    /// twice and a resend of those is a permanent stall rather than a slow one.
     #[must_use]
-    pub(crate) fn outstanding_summary(&self) -> Vec<(u128, u64, u8, u32)> {
+    pub(crate) fn outstanding_summary(&self) -> Vec<(u128, u64, Option<Action>, u8, u32)> {
         self.outstanding
             .iter()
-            .map(|(&(client, request), entry)| (client, request, entry.target, entry.attempts))
+            .map(|(&key, entry)| {
+                (
+                    key.0,
+                    key.1,
+                    self.auditor.in_flight_action(key),
+                    entry.target,
+                    entry.attempts,
+                )
+            })
             .collect()
     }
 
@@ -463,8 +472,11 @@ const FAULT_SEED_SALT: u64 = 0x5A1A_F0E5_FACE_0001;
 ///
 /// The invariants are asserted after every tick, so a consensus or
 /// workload regression panics at the tick it occurs (the seed in the message
-/// replays it). When `crash_per_tick_ratio > 0` the driver also injects
-/// crash-only faults via [`maybe_inject_crash`].
+/// replays it). Crash and restart injection runs through [`FaultInjector`],
+/// idle unless one of the two probabilities is set.
+///
+/// Discards the injector; use [`run_with_faults`] to read the crash and restart
+/// counts back.
 pub fn run(
     sim: &mut Simulator,
     workload: &mut Workload,
@@ -472,14 +484,32 @@ pub fn run(
     tick_budget: u64,
     replies_target: u64,
 ) -> u64 {
+    let mut injector = FaultInjector::new(workload.options.seed, sim.replica_count);
+    run_with_faults(
+        sim,
+        workload,
+        clients,
+        tick_budget,
+        replies_target,
+        &mut injector,
+    )
+}
+
+/// [`run`] against a caller-owned [`FaultInjector`], so a test can assert what
+/// was actually injected instead of trusting the probabilities to have fired.
+pub fn run_with_faults(
+    sim: &mut Simulator,
+    workload: &mut Workload,
+    clients: &[SimClient],
+    tick_budget: u64,
+    replies_target: u64,
+    injector: &mut FaultInjector,
+) -> u64 {
     let mut invariants = Invariants::new();
-    let mut fault_prng = Xoshiro256Plus::seed_from_u64(workload.options.seed ^ FAULT_SEED_SALT);
     let mut replies_seen = 0u64;
     for _ in 0..tick_budget {
         workload.tick();
-        if workload.options.crash_per_tick_ratio > 0.0 {
-            maybe_inject_crash(sim, workload, &mut fault_prng);
-        }
+        injector.step(sim, workload);
         // Resend before sampling: a timed-out request still holds the client's
         // slot, so `build_request` would decline it anyway.
         resubmit_due(sim, workload);
@@ -501,48 +531,141 @@ pub fn run(
     replies_seen
 }
 
-/// With probability `crash_per_tick_ratio`, crash one live non-primary replica,
-/// provided doing so leaves at least `min_survivors` live. Crash-only: a
-/// crashed replica is never restarted (that needs consensus durability).
+/// Crash and restart injection with stability windows, in the shape of
+/// TigerBeetle's VOPR: a crash must last a while before it may be repaired, and
+/// a repaired replica must run a while before it may fail again.
 ///
-/// "Non-primary" is partition-plane only: the exclusion set comes from
-/// `Simulator::primary_index`, which reads `partitions()`. The metadata-plane
-/// primary is not consulted; it is spared only by co-location, since every group
-/// starts at view 0 with `primary = view % replica_count` (so replica 0 leads
-/// both planes) and `min_survivors` keeps a commit quorum, so no view change
-/// moves it. Were the two planes' primaries to diverge, the metadata primary
-/// could be crashed.
-///
-/// Primaries are spared at all because the driver has no request-timeout/resend
-/// path: a request lost to a crashed primary would wedge the client's only
-/// in-flight slot. Forcing primary crashes (and the view change they trigger)
-/// while keeping traffic flowing is future work gated on that resend path.
-fn maybe_inject_crash(sim: &mut Simulator, workload: &Workload, prng: &mut Xoshiro256Plus) {
-    let live: Vec<u8> = (0..sim.replica_count)
-        .filter(|replica_idx| !sim.is_crashed(*replica_idx))
-        .collect();
-    if live.len() <= usize::from(workload.options.min_survivors) {
-        return;
+/// Owns the fault PRNG so crash scheduling stays reproducible from the seed yet
+/// independent of the traffic draw order. Draws nothing while both probabilities
+/// are zero, so a fault-free run replays bit-identically.
+pub struct FaultInjector {
+    prng: Xoshiro256Plus,
+    /// Tick of each replica's last crash or restart, indexed by replica id.
+    /// Compared against the stability windows to decide eligibility.
+    last_transition: Vec<u64>,
+    now: u64,
+    crashes: u64,
+    restarts: u64,
+}
+
+impl FaultInjector {
+    #[must_use]
+    pub fn new(seed: u64, replica_count: u8) -> Self {
+        Self {
+            prng: Xoshiro256Plus::seed_from_u64(seed ^ FAULT_SEED_SALT),
+            last_transition: vec![0; usize::from(replica_count)],
+            now: 0,
+            crashes: 0,
+            restarts: 0,
+        }
     }
-    let roll: f32 = prng.random();
-    if roll >= workload.options.crash_per_tick_ratio {
-        return;
+
+    #[must_use]
+    pub const fn crashes(&self) -> u64 {
+        self.crashes
     }
-    let primaries: HashSet<u8> = workload
-        .options
-        .namespaces
-        .iter()
-        .filter_map(|ns| sim.primary_index(*ns))
-        .collect();
-    let eligible: Vec<u8> = live
-        .into_iter()
-        .filter(|replica_idx| !primaries.contains(replica_idx))
-        .collect();
-    if eligible.is_empty() {
-        return;
+
+    #[must_use]
+    pub const fn restarts(&self) -> u64 {
+        self.restarts
     }
-    let victim = eligible[prng.random_range(0..eligible.len())];
-    sim.replica_crash(victim);
+
+    /// Advance one tick and maybe crash or restart one replica.
+    ///
+    /// Restart is considered before crash so a single tick never both revives
+    /// and kills, which would make the stability windows meaningless.
+    pub fn step(&mut self, sim: &mut Simulator, workload: &Workload) {
+        self.now += 1;
+        self.maybe_restart(sim, workload);
+        self.maybe_crash(sim, workload);
+    }
+
+    /// With probability `restart_per_tick_ratio`, restart one replica that has
+    /// been down at least `crash_stability_ticks`.
+    ///
+    /// This is what exercises rejoin: the replica comes back with its durable
+    /// superblock and metadata WAL but no volatile consensus state, asks the
+    /// current view's primary for a `StartView`, and repairs the log it missed.
+    fn maybe_restart(&mut self, sim: &mut Simulator, workload: &Workload) {
+        if workload.options.restart_per_tick_ratio <= 0.0 {
+            return;
+        }
+        let eligible: Vec<u8> = (0..sim.replica_count)
+            .filter(|replica_idx| sim.is_crashed(*replica_idx))
+            .filter(|replica_idx| {
+                self.stable_for(*replica_idx) >= workload.options.crash_stability_ticks
+            })
+            .collect();
+        if eligible.is_empty() {
+            return;
+        }
+        let roll: f32 = self.prng.random();
+        if roll >= workload.options.restart_per_tick_ratio {
+            return;
+        }
+        let revived = eligible[self.prng.random_range(0..eligible.len())];
+        sim.replica_restart(revived);
+        self.last_transition[usize::from(revived)] = self.now;
+        self.restarts += 1;
+    }
+
+    /// With probability `crash_per_tick_ratio`, crash one live replica that has
+    /// been up at least `restart_stability_ticks`, provided doing so leaves at
+    /// least `min_survivors` live.
+    ///
+    /// Primaries are excluded unless `spare_primary` is off. The exclusion set
+    /// comes from `Simulator::primary_index`, which reads `partitions()`, so it
+    /// names partition-plane primaries; the metadata primary is spared only by
+    /// co-location, since every group starts at view 0 with
+    /// `primary = view % replica_count`. Once views diverge across planes the
+    /// metadata primary can be crashed even with this on.
+    fn maybe_crash(&mut self, sim: &mut Simulator, workload: &Workload) {
+        if workload.options.crash_per_tick_ratio <= 0.0 {
+            return;
+        }
+        let live: Vec<u8> = (0..sim.replica_count)
+            .filter(|replica_idx| !sim.is_crashed(*replica_idx))
+            .collect();
+        if live.len() <= usize::from(workload.options.min_survivors) {
+            return;
+        }
+        let roll: f32 = self.prng.random();
+        if roll >= workload.options.crash_per_tick_ratio {
+            return;
+        }
+        let primaries: HashSet<u8> = if workload.options.spare_primary {
+            workload
+                .options
+                .namespaces
+                .iter()
+                .filter_map(|ns| sim.primary_index(*ns))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let eligible: Vec<u8> = live
+            .into_iter()
+            .filter(|replica_idx| !primaries.contains(replica_idx))
+            .filter(|replica_idx| {
+                self.stable_for(*replica_idx) >= workload.options.restart_stability_ticks
+            })
+            .collect();
+        if eligible.is_empty() {
+            return;
+        }
+        let victim = eligible[self.prng.random_range(0..eligible.len())];
+        sim.replica_crash(victim);
+        self.last_transition[usize::from(victim)] = self.now;
+        self.crashes += 1;
+    }
+
+    /// Ticks since this replica last changed state. A replica that never
+    /// transitioned counts from tick 0, so the first crash still has to wait out
+    /// `restart_stability_ticks`.
+    fn stable_for(&self, replica_idx: u8) -> u64 {
+        self.now
+            .saturating_sub(self.last_transition[usize::from(replica_idx)])
+    }
 }
 
 /// Submit every request whose reply is overdue (see [`Workload::due_resends`]).

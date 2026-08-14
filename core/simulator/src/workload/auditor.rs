@@ -184,6 +184,14 @@ impl ServerAuditor {
     }
 
     #[must_use]
+    /// The action of an outstanding request, if one is recorded for `key`.
+    /// Diagnostic only: names what a stalled run is waiting on, which the bare
+    /// `(client, request)` pair cannot.
+    #[must_use]
+    pub fn in_flight_action(&self, key: (u128, u64)) -> Option<Action> {
+        self.in_flight.get(&key).map(|entry| entry.action)
+    }
+
     pub fn in_flight_count(&self) -> usize {
         self.in_flight.len()
     }

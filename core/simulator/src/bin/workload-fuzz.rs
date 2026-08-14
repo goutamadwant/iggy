@@ -17,15 +17,17 @@
 
 //! Deterministic workload fuzzer for the Iggy simulator.
 //!
-//! Drives [`simulator::workload::run`] (per-tick invariants + optional crash
-//! injection) for a number of ticks, then optionally quiesces and asserts the
-//! Phase C consensus checks. Everything is a function of `--seed`, logged at
-//! start and on panic so any failure replays with `--seed <value>`.
+//! Drives [`simulator::workload::run_with_faults`] (per-tick invariants plus
+//! crash, restart and network fault injection) for a number of ticks, then
+//! optionally quiesces and asserts the Phase C consensus checks. Everything is a
+//! function of `--seed`, logged at start and on panic so any failure replays
+//! with `--seed <value>`.
 //!
 //! ```text
 //! workload-fuzz [--seed N] [--ticks N] [--clients N] [--replicas N]
 //!               [--plane partition|metadata|mixed|uniform]
-//!               [--faults none|light|heavy] [--crash-prob F] [--no-quiesce]
+//!               [--faults none|light|heavy] [--no-quiesce]
+//!               [--crash-prob F] [--restart-prob F] [--crash-primary]
 //!               [network overrides: --packet-loss, --replay, --partition-mode,
 //!                --partition-prob, --unpartition-prob, --clog-prob, ...]
 //! ```
@@ -48,7 +50,7 @@ use simulator::client::SimClient;
 use simulator::packet::{PacketSimulatorOptions, PartitionMode, PartitionSymmetry};
 use simulator::workload::actions::Action;
 use simulator::workload::options::{ActionWeights, WorkloadOptions};
-use simulator::workload::{Workload, oracle, run};
+use simulator::workload::{FaultInjector, Workload, oracle, run_with_faults};
 use strum::IntoEnumIterator;
 
 #[derive(Parser)]
@@ -70,8 +72,16 @@ struct Args {
     /// `NoAck`. `1.0` keeps every offset op on the replicated path.
     #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
     ack_quorum_ratio: f32,
+    /// Per-tick chance one eligible replica is crashed.
     #[arg(long, default_value_t = 0.0, value_parser = parse_unit_interval)]
     crash_prob: f32,
+    /// Per-tick chance one crashed replica is restarted. Without this a crash
+    /// is permanent and nothing exercises rejoin or log repair.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_unit_interval)]
+    restart_prob: f32,
+    /// Crash the primary too, putting a view change under live traffic.
+    #[arg(long)]
+    crash_primary: bool,
     #[arg(long)]
     no_quiesce: bool,
 
@@ -123,12 +133,11 @@ struct Args {
 /// Named network fault profile, in the spirit of TigerBeetle's VOPR modes: one
 /// flag for "how hostile is the network", rather than eleven.
 ///
-/// Anything but [`Faults::None`] currently stalls the run, and not because the
-/// cluster fails to make progress: `SimClient` has no request timeout, so a
-/// client holds its single in-flight slot forever once the request or its reply
-/// is dropped. Every profile below is therefore write-once-read-later until the
-/// client grows a resend path; they are wired now so the fault space is
-/// described in one place rather than rediscovered later.
+/// Progress falls off steeply with severity, because every lost frame costs a
+/// resend timeout: on one namespace with one client, a 3-replica cluster drains
+/// roughly 440 replies in 5000 ticks on a perfect network, 240 under `light` and
+/// 40 under `heavy`. All three still drain and converge; budget ticks
+/// accordingly rather than reading a low reply count as a stall.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Faults {
     /// Perfect network. Delays only, no loss and no partitions.
@@ -390,15 +399,32 @@ fn main() {
     let mut options = WorkloadOptions::new(seed, replicas, vec![ns]);
     options.client_count = clients;
     options.crash_per_tick_ratio = crash_prob;
+    options.restart_per_tick_ratio = args.restart_prob;
+    options.spare_primary = !args.crash_primary;
     options.ack_quorum_ratio = args.ack_quorum_ratio;
     options.weights = plane.weights();
     let mut workload = Workload::new(options);
 
-    let replies = run(&mut sim, &mut workload, &sim_clients, ticks, u64::MAX);
-    println!(
-        "ran {ticks} ticks; {replies} replies; crashed replicas: {}",
-        sim.crashed.len()
+    let mut injector = FaultInjector::new(seed, replicas);
+    let replies = run_with_faults(
+        &mut sim,
+        &mut workload,
+        &sim_clients,
+        ticks,
+        u64::MAX,
+        &mut injector,
     );
+    println!(
+        "ran {ticks} ticks; {replies} replies; crashes={} restarts={} still down: {}",
+        injector.crashes(),
+        injector.restarts(),
+        sim.crashed.len(),
+    );
+
+    // Printed before the quiesce assert, so a failed drain still reports what
+    // the run managed to do. Reading it after the assert meant the failure that
+    // most needs the numbers is the one that never shows them.
+    print_coverage(&workload);
 
     if quiesce {
         // A failed drain is a hard failure, not a warning. It used to be one
@@ -413,8 +439,16 @@ fn main() {
         );
         oracle::assert_converged(&sim, &workload);
         println!("quiesced and converged (leader-relative + entity oracle)");
+        // Again after the drain: the drain both answers outstanding requests and
+        // issues its own resends, so the pre-drain numbers are not the final ones.
+        print_coverage(&workload);
     }
 
+    println!("workload-fuzz: OK (seed={seed})");
+}
+
+/// Reply, rejection and resend counters plus per-action commits.
+fn print_coverage(workload: &Workload) {
     let stats = workload.auditor.stats();
     println!(
         "coverage: replies_seen={} replies_unknown={} committed_rejections={} \
@@ -431,6 +465,4 @@ fn main() {
             println!("  {action:?}: {commits} commits");
         }
     }
-
-    println!("workload-fuzz: OK (seed={seed})");
 }

@@ -3135,6 +3135,227 @@ mod tests {
     /// pipeline to `PIPELINE_PREPARE_QUEUE_MAX`; a request on `ns_b`
     /// still commits while `ns_a` is wedged (no quorum without backup
     /// acks); lifting the block drains `ns_a` completely.
+    /// A lost `PrepareOk` does not wedge the metadata plane: once the acks flow
+    /// again the primary reaches its commit quorum without client involvement.
+    ///
+    /// Worth pinning because the obvious reading of the code says otherwise. The
+    /// backup's admission check in `metadata::on_replicate` is a single
+    /// `header.op != current_op + 1`, so a prepare the backup ALREADY HOLDS is
+    /// dropped exactly like a forward gap, logging "dropping out-of-order
+    /// prepare (gap)" — and the primary's retransmit of an unacked prepare is
+    /// precisely such a duplicate. Reading only that check, a lost ack should
+    /// livelock: the primary retransmits forever and every retransmit is
+    /// dropped.
+    ///
+    /// It recovers anyway, so recovery does not depend on that check accepting
+    /// the duplicate, and those gap warnings are benign rather than evidence of
+    /// a stall. This test exists to keep that distinction honest: it fails if
+    /// recovery ever does come to rest on the retransmit being re-acked.
+    ///
+    /// Drops acks rather than crashing anyone, so the property under test is
+    /// about lost acks in general, not about restart recovery.
+    #[test]
+    fn lost_prepare_ok_is_recovered_by_retransmit() {
+        use iggy_binary_protocol::Command2;
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0x5EED_0077,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+
+        let committed_before = metadata_commit(&sim, 0);
+
+        // Drop only PrepareOk on both backup links. Everything else still flows,
+        // so the backups receive and journal the prepare; only the primary's
+        // evidence of that is lost.
+        for backup in 1..replica_count {
+            sim.network
+                .link_filter_mut(ProcessId::Replica(backup), ProcessId::Replica(0))
+                .remove(Command2::PrepareOk);
+        }
+
+        let msg = client.create_stream("wl-lost-ack");
+        sim.submit_request(client_id, 0, msg.into_generic());
+
+        // Long enough for the prepare to reach and be journaled by both backups
+        // while the primary sees no acks.
+        for _ in 0..200 {
+            sim.step();
+        }
+        assert_eq!(
+            metadata_commit(&sim, 0),
+            committed_before,
+            "the primary must not commit while every backup ack is dropped"
+        );
+        for backup in 1..replica_count {
+            assert!(
+                metadata_op(&sim, usize::from(backup)) > committed_before,
+                "backup {backup} must have journaled the prepare, else this test \
+                 proves nothing about a LOST ack"
+            );
+        }
+
+        // Restore the acks. From here the primary's retransmit is the only route
+        // to a commit, which is exactly the mechanism under test.
+        for backup in 1..replica_count {
+            sim.network
+                .link_filter_mut(ProcessId::Replica(backup), ProcessId::Replica(0))
+                .insert(Command2::PrepareOk);
+        }
+
+        for _ in 0..5_000 {
+            sim.step();
+            if metadata_commit(&sim, 0) > committed_before {
+                return;
+            }
+        }
+        panic!(
+            "metadata commit stuck at {} after 5000 ticks with healthy links: a lost \
+             PrepareOk is no longer recovered, so the backup's gap check is now \
+             swallowing the primary's retransmit",
+            metadata_commit(&sim, 0),
+        );
+    }
+
+    /// A prepare that every backup journaled but never acked still commits after
+    /// those backups restart.
+    ///
+    /// The rejoin path is what recovers it: a restarted replica comes back with
+    /// `current_op` at N from its own WAL, rejoins as a probing backup
+    /// (`Status::Recovering`, see `new_shard`), and its probe draws a targeted
+    /// `StartView` from the primary that returns it to `Normal` and gets the
+    /// tail acked. The primary's own retransmit cannot do it: the backup's
+    /// admission check in `metadata::on_replicate` is a single
+    /// `header.op != current_op + 1`, so a prepare it already holds is dropped
+    /// like a forward gap.
+    ///
+    /// Pinned because the fuzzer finds a run where this recovery does NOT happen
+    /// (see the module-level note on seed 42): there, two live backups hold op 45
+    /// with the primary at commit 44, and both log the gap drop for the whole
+    /// drain. This test covers the case that works, so a regression here narrows
+    /// where that one diverges rather than leaving both unexplained.
+    #[test]
+    fn unacked_prepare_commits_after_the_backup_restarts() {
+        use iggy_binary_protocol::Command2;
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0x5EED_0078,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+        let committed_before = metadata_commit(&sim, 0);
+
+        // Lose every backup ack, so the prepare is journaled cluster-wide while
+        // the primary stays one short of its commit quorum.
+        for backup in 1..replica_count {
+            sim.network
+                .link_filter_mut(ProcessId::Replica(backup), ProcessId::Replica(0))
+                .remove(Command2::PrepareOk);
+        }
+
+        let msg = client.create_stream("wl-unacked");
+        sim.submit_request(client_id, 0, msg.into_generic());
+        for _ in 0..200 {
+            sim.step();
+        }
+        for backup in 1..replica_count {
+            assert!(
+                metadata_op(&sim, usize::from(backup)) > committed_before,
+                "backup {backup} must hold the prepare before it is restarted"
+            );
+        }
+        assert_eq!(
+            metadata_commit(&sim, 0),
+            committed_before,
+            "the primary must not have committed while its acks were dropped"
+        );
+
+        // Restart every backup. Each recovers the unacked op from its own WAL and
+        // rejoins as a probing backup, which is the state the primary's
+        // retransmit cannot get an ack out of.
+        for backup in 1..replica_count {
+            sim.replica_crash(backup);
+            for _ in 0..50 {
+                sim.tick();
+            }
+            sim.replica_restart(backup);
+        }
+
+        // Healthy links from here: nothing but the protocol stands between the
+        // primary and its quorum.
+        for backup in 1..replica_count {
+            sim.network
+                .link_filter_mut(ProcessId::Replica(backup), ProcessId::Replica(0))
+                .insert(Command2::PrepareOk);
+        }
+
+        for _ in 0..10_000 {
+            sim.step();
+            if metadata_commit(&sim, 0) > committed_before {
+                return;
+            }
+        }
+        panic!(
+            "metadata commit stuck at {} after 10000 ticks with healthy links and \
+             every replica holding op {}: the restarted backups never re-acked the \
+             prepare they recovered from their own WALs",
+            metadata_commit(&sim, 0),
+            metadata_op(&sim, 1),
+        );
+    }
+
+    /// Committed metadata op on a replica's shard 0.
+    fn metadata_commit(sim: &Simulator, replica_idx: usize) -> u64 {
+        sim.replicas[replica_idx].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .expect("shard 0 owns metadata consensus")
+            .commit_min()
+    }
+
+    /// Highest metadata op a replica has journaled.
+    fn metadata_op(sim: &Simulator, replica_idx: usize) -> u64 {
+        sim.replicas[replica_idx]
+            .metadata_journal
+            .last_op()
+            .unwrap_or(0)
+    }
+
     #[test]
     fn per_partition_consensus_independence() {
         use consensus::PIPELINE_PREPARE_QUEUE_MAX;

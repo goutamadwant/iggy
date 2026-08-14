@@ -138,10 +138,10 @@ pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
         workload.total_in_flight(),
         workload.options.seed,
     );
-    for (client, request, target, attempts) in workload.outstanding_summary() {
+    for (client, request, action, target, attempts) in workload.outstanding_summary() {
         let _ = writeln!(
             report,
-            "  outstanding client={client} request={request} \
+            "  outstanding client={client} request={request} action={action:?} \
              last_target=replica {target} attempts={attempts}",
         );
     }
@@ -152,6 +152,26 @@ pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
             continue;
         }
         let _ = write!(report, "  replica {replica_idx}: live");
+        // Metadata plane first: a rejoining replica is quorum-invisible until it
+        // completes its view probe, so its status is the difference between "the
+        // cluster is slow" and "the cluster has no quorum despite enough live
+        // replicas".
+        if let Some(consensus) = sim.replicas[usize::from(replica_idx)].shards[0]
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+        {
+            let _ = write!(
+                report,
+                " | metadata status={:?} view={} log_view={} commit={} primary={}",
+                consensus.status(),
+                consensus.view(),
+                consensus.log_view(),
+                consensus.commit_min(),
+                consensus.is_primary(),
+            );
+        }
         for &ns in &workload.options.namespaces {
             let view = sim.consensus_view(usize::from(replica_idx), ns);
             let commit = sim
@@ -164,6 +184,26 @@ pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
             );
         }
         report.push('\n');
+        // Per-client table state. `check_request` admits a metadata request only
+        // when it is exactly `watermark + 1`, so the watermark says whether an
+        // outstanding request is still expected, already answered (and thus owed
+        // a cached-reply replay), or ahead of what this replica will accept.
+        let table = sim.replicas[usize::from(replica_idx)].shards[0]
+            .plane
+            .metadata()
+            .client_table
+            .borrow();
+        for client_id in table.client_ids() {
+            let _ = writeln!(
+                report,
+                "    client {client_id}: watermark={:?} epoch={:?} cached_reply_request={:?}",
+                table.get_watermark(client_id),
+                table.get_epoch(client_id),
+                table
+                    .get_reply(client_id)
+                    .map(|reply| reply.header().request),
+            );
+        }
     }
     report
 }
