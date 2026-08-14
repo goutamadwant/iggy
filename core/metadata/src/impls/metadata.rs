@@ -1204,21 +1204,38 @@ where
         // guard, not here.
         self.checkpoint_if_needed(consensus, journal).await;
 
-        // Backup: gap check (op == current_op + 1).
-        // Primary: sequencer pre-advanced by push_prepare_entry (guards
-        // sibling on_request races during journal.append await).
-        // TODO: promote the backup gap warn below to a hard assert or a
-        // repair-session trigger (message repair has landed; the drop-and-
-        // wait-for-retransmit path is the last soft handling left here).
+        // Backup: gap check against the JOURNAL head, not the sequencer.
+        //
+        // These are two different frontiers and they can disagree: the sequencer
+        // is pre-advanced on the primary by `push_prepare_entry` and re-synced on a
+        // backup only after a successful append, so a replica can carry a sequencer
+        // one ahead of what its WAL holds. Gating admission on the sequencer then
+        // rejects the very prepare that would heal the log -- observed as a backup
+        // with `last_op = 44` refusing op 45 because its sequencer said to expect
+        // 46. The primary retransmits that op for the life of the process, every
+        // backup logs it as an out-of-order gap, it never reaches a commit quorum,
+        // and its client is never answered.
+        //
+        // The journal is the only frontier that answers "what can be appended
+        // next", which is what this check is for; the hash-chain verification below
+        // is likewise stated against the journal. TigerBeetle avoids the question
+        // by keeping a single frontier (`self.op` IS the log head, see
+        // `on_prepare`), so nothing can drift.
+        //
+        // A prepare at or below the head that this replica already holds was
+        // re-acked and returned above, so anything reaching here is either the next
+        // op or a real forward gap for repair to fill.
         let is_backup = consensus.is_follower();
         if is_backup {
-            if header.op != current_op + 1 {
+            let journal_head = journal.handle().last_op().unwrap_or(0);
+            if header.op != journal_head + 1 {
                 warn!(
                     target: "iggy.metadata.diag",
                     plane = "metadata",
                     replica_id = consensus.replica(),
                     op = header.op,
-                    expected = current_op + 1,
+                    expected = journal_head + 1,
+                    sequencer_op = current_op,
                     "on_replicate: dropping out-of-order prepare (gap)"
                 );
                 return;
@@ -4752,6 +4769,96 @@ mod tests {
         assert!(
             is_caught_up_primary(consensus),
             "gate must reopen once the prefix is fully applied"
+        );
+    }
+
+    /// A backup admits the prepare its JOURNAL needs next, even when its
+    /// sequencer has run ahead of the journal.
+    ///
+    /// The two frontiers legitimately disagree: `on_start_view` sets the
+    /// sequencer to the view's announced head, deliberately ahead of what this
+    /// replica holds, because the bodies arrive afterwards by retransmit or
+    /// repair. Gating admission on the sequencer therefore rejected exactly the
+    /// prepare that would heal the log -- a backup with journal head 44 refusing
+    /// op 45 because its adopted head said to expect 46. The primary retransmits
+    /// that op forever, every backup logs it as an out-of-order gap, it never
+    /// reaches a commit quorum, and its client is never answered. Systematic for
+    /// any rejoining replica, so the deterministic simulator wedged on every
+    /// metadata workload under crash/restart injection until this was gated on the
+    /// journal instead.
+    ///
+    /// TigerBeetle sidesteps the question by keeping a single frontier: `self.op`
+    /// IS the log head, and `on_prepare` routes anything at or below it to
+    /// `on_repair`, which re-acks a prepare already held.
+    #[compio::test]
+    async fn backup_admits_the_prepare_its_journal_needs_despite_a_leading_sequencer() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+        /// Stands in for a head adopted from a `StartView` whose bodies have not
+        /// arrived, so it sits well above the empty journal.
+        const ADOPTED_HEAD: u64 = 5;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        // Replica 1 of 3 at view 0, so `primary_index(0) == 0` makes this a backup
+        // and `on_replicate` takes the gap-check branch.
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                Some(dir.path().to_path_buf()),
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        assert!(
+            consensus.is_follower(),
+            "replica 1 of 3 at view 0 must be a backup for this to exercise the gap check"
+        );
+        md.client_table.borrow_mut().commit_register(
+            CLIENT,
+            ACTING_USER,
+            register_reply(CLIENT, SESSION),
+        );
+
+        // Minted while the sequencer is still at 0, so it carries op 1: exactly
+        // what the empty journal needs next.
+        let prepare = md
+            .prepare_request(create_stream_request(CLIENT, 1, "s1"))
+            .expect("CreateStream is client-allowed");
+        assert_eq!(prepare.header().op, 1, "the first prepare must be op 1");
+
+        // Now run the sequencer ahead, as adopting a started view does.
+        consensus.sequencer().set_sequence(ADOPTED_HEAD);
+        let journal = md.journal.as_ref().unwrap();
+        assert_eq!(
+            journal.last_op(),
+            None,
+            "the journal must still be empty, else the divergence under test is absent"
+        );
+
+        md.on_replicate(prepare).await;
+
+        assert!(
+            journal.header(1).is_some(),
+            "backup dropped the prepare its journal needed next because its sequencer \
+             was ahead; the primary's retransmit of this op can never be accepted, so \
+             the op never commits and its client never gets a reply"
         );
     }
 
