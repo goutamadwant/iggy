@@ -24,18 +24,15 @@
 //!
 //! ```text
 //! workload-fuzz [--seed N] [--ticks N] [--clients N] [--replicas N]
+//!               [--plane partition|metadata|mixed|uniform]
 //!               [--crash-prob F] [--no-quiesce]
 //! ```
 //!
-//! The default workload is partition-plane (`SendMessages`): it drains and
-//! converges. Metadata and mixed-plane workloads are gated on the metadata
-//! request-gap: a client's replicated-metadata request ids must arrive
-//! contiguously (`committed + 1`), so a dropped or reordered metadata request
-//! opens a permanent `RequestGap` that wedges that client's metadata plane.
-//! Broader op coverage lands once the workload generator models that
-//! constraint.
+//! `--plane` selects the op mix (see [`ActionWeights`]). Partition-plane runs
+//! drain and converge most readily; `uniform` is the widest per-tick op
+//! coverage.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use iggy_common::IggyByteSize;
 use server_common::sharding::IggyNamespace;
 use server_common::{MemoryPool, MemoryPoolConfigOther};
@@ -59,10 +56,41 @@ struct Args {
     clients: u8,
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..))]
     replicas: u8,
+    /// Op mix to draw from.
+    #[arg(long, value_enum, default_value_t = Plane::Partition)]
+    plane: Plane,
+    /// Probability a consumer-offset store asks for `Quorum` rather than
+    /// `NoAck`. `1.0` keeps every offset op on the replicated path.
+    #[arg(long, default_value_t = 0.5, value_parser = parse_unit_interval)]
+    ack_quorum_ratio: f32,
     #[arg(long, default_value_t = 0.0, value_parser = parse_unit_interval)]
     crash_prob: f32,
     #[arg(long)]
     no_quiesce: bool,
+}
+
+/// Which plane the sampled ops target. Maps onto an [`ActionWeights`] preset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Plane {
+    /// Writes and consumer offsets only.
+    Partition,
+    /// Replicated metadata mutations only.
+    Metadata,
+    /// Stream creates over a write-heavy base.
+    Mixed,
+    /// Every action equally likely.
+    Uniform,
+}
+
+impl Plane {
+    fn weights(self) -> ActionWeights {
+        match self {
+            Self::Partition => ActionWeights::partition_only(),
+            Self::Metadata => ActionWeights::metadata_only(),
+            Self::Mixed => ActionWeights::default(),
+            Self::Uniform => ActionWeights::uniform(),
+        }
+    }
 }
 
 /// Clap value parser: accept a probability in `[0.0, 1.0]`.
@@ -80,12 +108,23 @@ fn parse_unit_interval(raw: &str) -> Result<f32, String> {
 fn main() {
     let args = Args::parse();
 
+    // Server-side diagnostics (`emit_partition_diag` and friends) are the only
+    // record of a request the server dropped after logging, which is exactly the
+    // shape that wedges a client's in-flight slot. Without a subscriber they go
+    // nowhere and the run looks like an unexplained stall, so install one and let
+    // `RUST_LOG` select. Off by default: a WARN per dropped frame drowns the run.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+
     // A provided seed reproduces a prior run exactly; otherwise draw one and
     // log it. Both the network and workload PRNGs derive from it.
     let seed = args.seed.unwrap_or_else(rand::random);
     let ticks = args.ticks;
     let clients = args.clients;
     let replicas = args.replicas;
+    let plane = args.plane;
     let crash_prob = args.crash_prob;
     let quiesce = !args.no_quiesce;
 
@@ -97,7 +136,7 @@ fn main() {
 
     println!(
         "workload-fuzz: seed={seed} ticks={ticks} clients={clients} replicas={replicas} \
-         crash_prob={crash_prob} quiesce={quiesce}"
+         plane={plane:?} crash_prob={crash_prob} quiesce={quiesce}"
     );
 
     // poll_messages / reply paths panic without an initialized pool; disabled
@@ -131,7 +170,8 @@ fn main() {
     let mut options = WorkloadOptions::new(seed, replicas, vec![ns]);
     options.client_count = clients;
     options.crash_per_tick_ratio = crash_prob;
-    options.weights = ActionWeights::new(&[(Action::SendMessages, 100)]);
+    options.ack_quorum_ratio = args.ack_quorum_ratio;
+    options.weights = plane.weights();
     let mut workload = Workload::new(options);
 
     let replies = run(&mut sim, &mut workload, &sim_clients, ticks, u64::MAX);
@@ -146,8 +186,8 @@ fn main() {
             println!("quiesced and converged (leader-relative + entity oracle)");
         } else {
             println!(
-                "WARN: did not quiesce within budget — expected when crashing to bare quorum \
-                 or under the metadata request-gap limitation; per-tick invariants still held"
+                "WARN: did not quiesce within budget — expected when crashing to bare quorum; \
+                 per-tick invariants still held"
             );
         }
     }

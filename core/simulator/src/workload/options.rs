@@ -47,6 +47,78 @@ impl ActionWeights {
         Self { weights }
     }
 
+    /// Partition plane only: writes plus consumer-offset traffic, no metadata
+    /// mutation. The regime that drains and converges most readily, so it is
+    /// what a run reaches for when the question is about replication rather
+    /// than about the state machine.
+    #[must_use]
+    pub fn partition_only() -> Self {
+        Self::new(&[
+            (Action::SendMessages, 60),
+            (Action::StoreConsumerOffset2, 25),
+            (Action::DeleteConsumerOffset2, 5),
+            (Action::StoreConsumerOffset, 7),
+            (Action::DeleteConsumerOffset, 3),
+        ])
+    }
+
+    /// Metadata plane only: every replicated metadata mutation, weighted so
+    /// creates outrun deletes and the shadow keeps a live population to sample
+    /// duplicate- and missing-target outcomes against. `DeleteSegments` is
+    /// excluded: it resolves against partition state the partition-plane
+    /// presets build, so it belongs to a mixed run.
+    #[must_use]
+    pub fn metadata_only() -> Self {
+        Self::new(&[
+            (Action::CreateStream, 12),
+            (Action::UpdateStream, 6),
+            (Action::DeleteStream, 6),
+            (Action::PurgeStream, 4),
+            (Action::CreateTopic, 12),
+            (Action::UpdateTopic, 6),
+            (Action::DeleteTopic, 6),
+            (Action::PurgeTopic, 4),
+            (Action::CreatePartitions, 6),
+            (Action::DeletePartitions, 4),
+            (Action::CreateConsumerGroup, 6),
+            (Action::DeleteConsumerGroup, 4),
+            (Action::CreateUser, 6),
+            (Action::UpdateUser, 3),
+            (Action::DeleteUser, 3),
+            (Action::ChangePassword, 3),
+            (Action::UpdatePermissions, 3),
+            (Action::CreatePersonalAccessToken, 3),
+            (Action::DeletePersonalAccessToken, 3),
+        ])
+    }
+
+    /// Every action equally likely. Widest op coverage per tick, at the cost of
+    /// a shallow population per entity kind.
+    ///
+    /// `Action::COUNT` does not divide 100, so the first `100 % COUNT` actions
+    /// carry one extra point. Spread that way rather than asserting the count
+    /// divides evenly, so appending an `Action` never breaks this preset.
+    #[must_use]
+    pub fn uniform() -> Self {
+        use strum::IntoEnumIterator;
+
+        let count = u32::try_from(Action::COUNT).expect("Action::COUNT fits u32");
+        let base = 100 / count;
+        let remainder = 100 % count;
+        let entries: Vec<(Action, u8)> = Action::iter()
+            .enumerate()
+            .map(|(idx, action)| {
+                let extra = u32::try_from(idx).expect("action index fits u32") < remainder;
+                let weight = base + u32::from(extra);
+                (
+                    action,
+                    u8::try_from(weight).expect("per-action weight is at most 100"),
+                )
+            })
+            .collect();
+        Self::new(&entries)
+    }
+
     #[must_use]
     pub const fn weight(&self, action: Action) -> u8 {
         self.weights[action as usize]
