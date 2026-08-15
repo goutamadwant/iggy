@@ -573,6 +573,9 @@ impl Simulator {
             ));
         }
 
+        // From here this client talks the real client protocol; see
+        // `SimClient::shell_wire`.
+        client.set_shell_wire();
         let msg = client
             .login(replica::SHELL_ROOT_USERNAME, replica::SHELL_ROOT_PASSWORD)
             .into_generic();
@@ -3594,6 +3597,66 @@ mod tests {
         // therefore re-arms every round rather than converging, which is why this
         // test asserts on the handshake instead of on the transfer completing.
         // Wiring a snapshot coordinator is what closes that gap.
+    }
+
+    /// Personal-access-token requests commit through the dispatch layer.
+    ///
+    /// They used to be refused there with `InvalidCommand` on every attempt,
+    /// because `SimClient` sent the REPLICATED shape
+    /// (`[user_id][name][expiry][token_hash]`) rather than the client one
+    /// (`[name][expiry]`). A client cannot produce the replicated shape: it does
+    /// not know the token hash, which the server mints in
+    /// `maybe_rewrite_pat_request` after resolving the acting user from the
+    /// session. The raw path has no dispatch layer and so no rewrite, which is
+    /// why the wrong shape worked there and hid the bug.
+    ///
+    /// Asserts a commit rather than merely a reply: a denial is also a reply, and
+    /// it was the denials that went unnoticed for so long.
+    #[test]
+    fn personal_access_tokens_commit_through_the_dispatch_shell() {
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0x9A7_0001,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::with_shards_shell(
+            usize::from(replica_count),
+            1,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+        sim.shell_login(&client);
+
+        let create = client.create_personal_access_token("wl-pat-token", 0);
+        let request = create.header().request;
+        sim.submit_request(client_id, 0, create.into_generic());
+        let mut status = None;
+        for _ in 0..400 {
+            if let Some(reply) = sim
+                .step()
+                .into_iter()
+                .find(|reply| reply.header().request == request)
+            {
+                status = Some(reply.header().status);
+                break;
+            }
+        }
+        assert_eq!(
+            status,
+            Some(0),
+            "creating a personal access token through dispatch was refused; a \
+             nonzero status here means the request never reached consensus"
+        );
     }
 
     /// A client that dials a BACKUP still gets a working session, and the login

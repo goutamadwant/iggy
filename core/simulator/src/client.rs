@@ -31,6 +31,10 @@ use iggy_binary_protocol::requests::messages::{
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
 };
+use iggy_binary_protocol::requests::personal_access_tokens::{
+    CreatePersonalAccessTokenRequest as WireCreatePersonalAccessTokenRequest,
+    DeletePersonalAccessTokenRequest as WireDeletePersonalAccessTokenRequest,
+};
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, PurgeStreamRequest, UpdateStreamRequest,
@@ -79,6 +83,21 @@ pub struct SimClient {
     /// the body a pure function of the seed. See [`SimClient::next_message_id`].
     message_counter: Cell<u64>,
     session: Cell<u64>,
+    /// Whether this client talks to the server's real dispatch layer.
+    ///
+    /// It changes what a PAT request must contain. A real client sends
+    /// `[name][expiry]` and the server mints the token and its hash in
+    /// `maybe_rewrite_pat_request`, rewriting the request into the replicated
+    /// form before it reaches consensus. The simulator's raw path has no dispatch
+    /// layer and therefore no rewrite, so a request submitted there has to arrive
+    /// already in the replicated form.
+    ///
+    /// The same split already exists for sessions (`register` for the raw path,
+    /// `login` for the shell); this makes it explicit for the one op family whose
+    /// BODY differs rather than just its envelope. Set by
+    /// `Simulator::shell_login_via`, so it follows the path the client actually
+    /// took rather than being configured separately.
+    shell_wire: Cell<bool>,
 }
 
 impl SimClient {
@@ -90,7 +109,15 @@ impl SimClient {
             partition_counter: Cell::new(0),
             message_counter: Cell::new(0),
             session: Cell::new(0),
+            shell_wire: Cell::new(false),
         }
+    }
+
+    /// Mark this client as talking to the real dispatch layer, so PAT requests
+    /// carry the client wire shape rather than the replicated one. See
+    /// [`SimClient::shell_wire`].
+    pub fn set_shell_wire(&self) {
+        self.shell_wire.set(true);
     }
 
     #[must_use]
@@ -503,14 +530,23 @@ impl SimClient {
         name: &str,
         expiry: u64,
     ) -> Message<RoutedRequestHeader> {
+        let name = WireName::new(name).expect("PAT name must be valid");
+        // Through dispatch, send what a real client sends: the server resolves
+        // the acting user from the session and mints the token and its hash in
+        // `maybe_rewrite_pat_request`, rewriting this into the replicated form
+        // before consensus sees it. A client cannot produce that form itself --
+        // it does not know the hash -- so sending it here is what made every PAT
+        // request fail to decode as `InvalidCommand`.
+        if self.shell_wire.get() {
+            let wire = WireCreatePersonalAccessTokenRequest { name, expiry };
+            return self.build_request(Operation::CreatePersonalAccessToken, &wire.to_bytes());
+        }
+        // Raw path: no dispatch layer, so no rewrite ever happens and the request
+        // has to arrive already replicated.
         let wire = CreatePersonalAccessTokenRequest {
             user_id: 0,
-            name: WireName::new(name).expect("PAT name must be valid"),
+            name,
             expiry,
-            // Deterministic stub for the simulator. Production servers mint
-            // this in `maybe_rewrite_pat_request` on the primary; the
-            // simulator drives the wire path directly without that rewrite
-            // step.
             token_hash: [b'a'; 64],
         };
         self.build_request(Operation::CreatePersonalAccessToken, &wire.to_bytes())
@@ -519,9 +555,15 @@ impl SimClient {
     /// # Panics
     /// Panics if `name` is not a valid `WireName`.
     pub fn delete_personal_access_token(&self, name: &str) -> Message<RoutedRequestHeader> {
+        let name = WireName::new(name).expect("PAT name must be valid");
+        // See `create_personal_access_token` for why the shape depends on the path.
+        if self.shell_wire.get() {
+            let wire = WireDeletePersonalAccessTokenRequest { name };
+            return self.build_request(Operation::DeletePersonalAccessToken, &wire.to_bytes());
+        }
         let wire = DeletePersonalAccessTokenRequest {
             user_id: 0,
-            name: WireName::new(name).expect("PAT name must be valid"),
+            name,
             only_if_expired: false,
         };
         self.build_request(Operation::DeletePersonalAccessToken, &wire.to_bytes())
