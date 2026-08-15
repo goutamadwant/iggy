@@ -118,6 +118,10 @@ pub struct SimReplica {
     /// regression. Populated on the way into a restart (see
     /// [`Simulator::replica_restart`]) and consumed by `materialise_partition`.
     partition_logs: RefCell<HashMap<IggyNamespace, (RetainedPartitionLog, u64, u64)>>,
+    /// This replica's data directory when checkpoints are enabled, `None`
+    /// otherwise. Retained for the same reason as the WAL and the superblocks: a
+    /// restart must read back the snapshot its previous incarnation wrote.
+    data_dir: Option<std::path::PathBuf>,
     /// Keeps each pump's stop channel alive; dropping one would end that
     /// pump gracefully, which is reserved for future shutdown/restart
     /// tests (crash uses `DetExecutor::abort` instead).
@@ -252,6 +256,51 @@ impl Simulator {
         )
     }
 
+    /// [`Simulator::new`] with checkpoints enabled, each replica rooted at
+    /// `<data_dir_root>/replica-N`.
+    ///
+    /// A data directory is what arms the metadata `SnapshotCoordinator`; without
+    /// one `checkpoint_if_needed` returns immediately and no replica ever
+    /// checkpoints, so nothing produces the snapshot a state transfer serves.
+    ///
+    /// Opt-in and separate from the other constructors because the coordinator
+    /// persists through `std::fs`, and a harness whose defining property is that
+    /// it touches nothing outside memory should not start writing files because a
+    /// scenario forgot to say otherwise. The writes are synchronous and never
+    /// touch the executor, so replay stays deterministic; the caller owns the
+    /// directory's lifetime (a `tempfile::TempDir` in tests).
+    ///
+    /// Pair with [`Simulator::set_metadata_journal_slots`]: a checkpoint is forced
+    /// by the journal running low on slots, and the simulated journal is unbounded
+    /// until told otherwise.
+    ///
+    /// # Panics
+    /// Panics on duplicate `client_id`s, `shards_per_replica == 0`, or if the
+    /// per-replica directories cannot be created.
+    pub fn with_checkpoints(
+        replica_count: usize,
+        clients: impl Iterator<Item = u128>,
+        network_options: PacketSimulatorOptions,
+        data_dir_root: std::path::PathBuf,
+    ) -> Self {
+        Self::build_inner(
+            replica_count,
+            1,
+            clients,
+            network_options,
+            false,
+            Some(data_dir_root),
+        )
+    }
+
+    /// Bound every replica's metadata journal to `slots`, so filling it forces a
+    /// checkpoint. See [`deps::SimJournal::set_slot_count`].
+    pub fn set_metadata_journal_slots(&self, slots: usize) {
+        for replica in &self.replicas {
+            replica.metadata_journal.set_slot_count(slots);
+        }
+    }
+
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn build(
         replica_count: usize,
@@ -259,6 +308,25 @@ impl Simulator {
         clients: impl Iterator<Item = u128>,
         network_options: PacketSimulatorOptions,
         shell: bool,
+    ) -> Self {
+        Self::build_inner(
+            replica_count,
+            shards_per_replica,
+            clients,
+            network_options,
+            shell,
+            None,
+        )
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+    fn build_inner(
+        replica_count: usize,
+        shards_per_replica: u16,
+        clients: impl Iterator<Item = u128>,
+        network_options: PacketSimulatorOptions,
+        shell: bool,
+        data_dir_root: Option<std::path::PathBuf>,
     ) -> Self {
         assert!(
             shards_per_replica >= 1,
@@ -312,6 +380,17 @@ impl Simulator {
             // restart increments in `replica_restart` never collide across replicas.
             // Non-zero.
             let metadata_incarnation = 1 + (u128::from(id) << 64);
+            // One directory per replica when checkpoints are enabled, created up
+            // front because the snapshot coordinator writes into
+            // `<dir>/metadata/` and does not create it. Retained on `SimReplica`
+            // so a restart reads back the snapshot its previous incarnation wrote,
+            // exactly as the retained WAL and superblock already do.
+            let replica_data_dir = data_dir_root.as_ref().map(|root| {
+                let dir = root.join(format!("replica-{i}"));
+                std::fs::create_dir_all(dir.join(metadata::impls::METADATA_DIR))
+                    .expect("simulator data directory is creatable");
+                dir
+            });
 
             // One crossfire mesh per replica; every shard gets a clone of
             // the canonical senders vec and exclusively takes its inbox.
@@ -354,6 +433,7 @@ impl Simulator {
                     shard_journal,
                     None, // fresh boot: no recovered VSR state
                     metadata_incarnation,
+                    (shard_idx == 0).then(|| replica_data_dir.clone()).flatten(),
                 );
                 if shard_idx == 0 {
                     metadata_bundle = Some(
@@ -381,6 +461,7 @@ impl Simulator {
                 metadata_incarnation,
                 partition_superblocks: RefCell::new(HashMap::new()),
                 partition_logs: RefCell::new(HashMap::new()),
+                data_dir: replica_data_dir,
                 _stop_txs: stop_txs,
                 pump_tasks,
             });
@@ -880,6 +961,10 @@ impl Simulator {
             .read_latest_sync()
             .and_then(|bytes| VsrState::try_from(bytes.as_slice()).ok());
 
+        // Carried across the rebuild like the WAL and superblocks: the rebuilt
+        // replica has to find the snapshot its previous incarnation persisted.
+        let replica_data_dir = self.replicas[idx].data_dir.clone();
+
         let consensus_clock = ConsensusClock::new(Rc::new(SimClock::new(self.executor.timer())));
         let outbox = Rc::clone(&self.outboxes[idx]);
         let (senders, mut inboxes) =
@@ -914,6 +999,7 @@ impl Simulator {
                 shard_journal,
                 recovered_state,
                 metadata_incarnation,
+                (shard_idx == 0).then(|| replica_data_dir.clone()).flatten(),
             );
             if shard_idx == 0 {
                 metadata_bundle =
@@ -937,6 +1023,7 @@ impl Simulator {
             metadata_incarnation,
             partition_superblocks: RefCell::new(partition_superblocks),
             partition_logs: RefCell::new(partition_logs),
+            data_dir: replica_data_dir,
             _stop_txs: stop_txs,
             pump_tasks,
         };
@@ -3314,6 +3401,92 @@ mod tests {
     /// pipeline to `PIPELINE_PREPARE_QUEUE_MAX`; a request on `ns_b`
     /// still commits while `ns_a` is wedged (no quorum without backup
     /// acks); lifting the block drains `ns_a` completely.
+    /// A replica that checkpoints serves a real state transfer: the rejoining
+    /// peer fetches the snapshot in chunks rather than stalling at the handshake.
+    ///
+    /// The companion to
+    /// [`repair_below_the_snapshot_floor_escalates_to_state_transfer`], which
+    /// stamps a watermark without producing snapshot bytes and so reaches only
+    /// `StateTransferTarget`. Here the coordinator is armed with a data directory
+    /// and the journal is bounded, so the cluster checkpoints for real and the
+    /// transfer has artifacts to serve.
+    ///
+    /// Two things had to be true for a checkpoint to happen at all, and neither
+    /// was: metadata was built without a data directory, so there was no
+    /// `SnapshotCoordinator`; and the simulated journal reported no capacity
+    /// limit, so `should_checkpoint` never fired even where a coordinator existed.
+    #[test]
+    fn checkpointing_cluster_serves_a_chunked_state_transfer() {
+        use iggy_binary_protocol::Command2;
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let root = tempfile::tempdir().expect("temp dir for the simulator's snapshots");
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0xC4E0_0001,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::with_checkpoints(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            network_opts,
+            root.path().to_path_buf(),
+        );
+        // Small enough that the ops below cross the margin; the coordinator forces
+        // a checkpoint once free slots fall to its margin (64 by default).
+        sim.set_metadata_journal_slots(80);
+
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+
+        let lagging = 2u8;
+        sim.replica_crash(lagging);
+
+        // Commit past the checkpoint margin while the lagging replica is down, so
+        // the survivors checkpoint and compact the prefix it is missing.
+        for sequence in 0..40u32 {
+            let msg = client.create_stream(&format!("wl-checkpoint-{sequence}"));
+            sim.submit_request(client_id, 0, msg.into_generic());
+            for _ in 0..40 {
+                sim.step();
+            }
+        }
+
+        let snapshot = root
+            .path()
+            .join("replica-0")
+            .join("metadata")
+            .join("snapshot.bin");
+        assert!(
+            snapshot.exists(),
+            "the primary never checkpointed, so there is no snapshot to transfer: \
+             raise the op count or lower the journal slot count"
+        );
+
+        sim.replica_restart(lagging);
+        for _ in 0..8_000 {
+            sim.step();
+        }
+
+        assert!(
+            sim.network.delivered_any(Command2::RequestStateChunk),
+            "the rejoining replica never asked for a chunk, so the transfer \
+             stalled at the handshake exactly as it does without a checkpoint"
+        );
+        assert!(
+            sim.network.delivered_any(Command2::StateChunk),
+            "no chunk was served: the peer offered a transfer it could not fulfil"
+        );
+    }
+
     /// A backup whose gap sits below the serving peer's snapshot floor is told
     /// `RangeEvicted` and converts its repair into a state transfer.
     ///
