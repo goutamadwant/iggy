@@ -20,10 +20,11 @@ use crate::WireIdentifier;
 use crate::codec::{WireDecode, WireEncode, read_u8};
 use bytes::{BufMut, BytesMut};
 
-/// Wire discriminant for a single consumer (vs a `ConsumerGroup`). Public for
-/// the same reason as its sibling below, plus one more: `decode` accepts only
-/// these two values, so anything synthesizing a consumer needs to name them
-/// rather than guess a small integer.
+/// Wire discriminant for a single consumer (vs a `ConsumerGroup`).
+///
+/// Public for the same reason as its sibling below, plus one more: `decode`
+/// accepts only these two values, so anything synthesizing a consumer needs to
+/// name them rather than guess a small integer.
 pub const KIND_CONSUMER: u8 = 1;
 /// Wire discriminant for a consumer-group consumer (vs a single `Consumer`).
 /// Public so the server dispatch can match on it by name instead of a raw `2`.

@@ -141,7 +141,7 @@ impl Workload {
 
     /// Advance the resend clock by one tick. Called once per driver iteration;
     /// [`Self::due_resends`] measures against it.
-    pub fn tick(&mut self) {
+    pub const fn tick(&mut self) {
         self.now += 1;
     }
 
@@ -550,9 +550,10 @@ pub fn run_with_faults(
     replies_seen
 }
 
-/// Crash and restart injection with stability windows, in the shape of
-/// TigerBeetle's VOPR: a crash must last a while before it may be repaired, and
-/// a repaired replica must run a while before it may fail again.
+/// Crash and restart injection with stability windows.
+///
+/// Shaped after `TigerBeetle`'s VOPR: a crash must last a while before it may be
+/// repaired, and a repaired replica must run a while before it may fail again.
 ///
 /// Owns the fault PRNG so crash scheduling stays reproducible from the seed yet
 /// independent of the traffic draw order. Draws nothing while both probabilities

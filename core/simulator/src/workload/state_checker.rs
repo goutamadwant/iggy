@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Cross-replica committed-log equality, after TigerBeetle's
-//! `testing/cluster/state_checker.zig`.
+//! Cross-replica committed-log equality.
+//!
+//! After `TigerBeetle`'s `testing/cluster/state_checker.zig`.
 //!
 //! The per-tick checks in [`super::invariants`] catch a single replica
 //! contradicting itself, and [`super::oracle`] compares committed metadata
@@ -24,7 +25,7 @@
 //! is the actual consensus property: two replicas that both committed op N must
 //! have committed the same op N.
 //!
-//! Modelled on TigerBeetle's checker rather than invented: it keeps one canonical
+//! Modelled on `TigerBeetle`'s checker rather than invented: it keeps one canonical
 //! commit chain, asserts every replica agrees with it wherever they overlap
 //! (`(commit_a == commit_b) == (checksum_a == checksum_b)`), and asserts the chain
 //! is hash-linked (`header_b.parent == checksum_a`). Recording which replicas

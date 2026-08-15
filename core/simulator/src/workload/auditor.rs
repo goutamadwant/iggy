@@ -217,6 +217,7 @@ impl ServerAuditor {
         self.in_flight.get(&key).map(|entry| entry.action)
     }
 
+    #[must_use]
     pub fn in_flight_count(&self) -> usize {
         self.in_flight.len()
     }

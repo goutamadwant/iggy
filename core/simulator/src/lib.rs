@@ -281,7 +281,7 @@ impl Simulator {
         replica_count: usize,
         clients: impl Iterator<Item = u128>,
         network_options: PacketSimulatorOptions,
-        data_dir_root: std::path::PathBuf,
+        data_dir_root: &std::path::Path,
     ) -> Self {
         Self::build_inner(
             replica_count,
@@ -326,7 +326,7 @@ impl Simulator {
         clients: impl Iterator<Item = u128>,
         network_options: PacketSimulatorOptions,
         shell: bool,
-        data_dir_root: Option<std::path::PathBuf>,
+        data_dir_root: Option<&std::path::Path>,
     ) -> Self {
         assert!(
             shards_per_replica >= 1,
@@ -583,7 +583,8 @@ impl Simulator {
         // (`build_reply_with_body` maps the session field to `op`).
         let session = self
             .await_setup_reply(client.client_id(), target, &msg, "shell_login")
-            .map_or(0, |reply| reply.header().op);
+            .header()
+            .op;
         assert!(session > 0, "shell_login: login reply carried no session");
         client.bind_session(session);
     }
@@ -591,22 +592,26 @@ impl Simulator {
     /// Submit `message` to `target` and step until a client reply arrives,
     /// resubmitting every [`SETUP_RETRY_STEPS`] steps.
     ///
-    /// Returns the first reply, or `None` once [`SETUP_TOTAL_STEPS`] is spent.
     /// The same message is resubmitted verbatim, so the request id is stable and
     /// the metadata client table treats a retry as a duplicate.
+    ///
+    /// # Panics
+    /// If no reply arrives within [`SETUP_TOTAL_STEPS`]. A setup handshake that
+    /// never completes leaves the fixture unusable, so there is no useful
+    /// `None` for a caller to handle.
     fn await_setup_reply(
         &mut self,
         client_id: u128,
         target: u8,
         message: &Message<GenericHeader>,
         label: &str,
-    ) -> Option<Message<ReplyHeader>> {
+    ) -> Message<ReplyHeader> {
         for step in 0..SETUP_TOTAL_STEPS {
             if step % SETUP_RETRY_STEPS == 0 {
                 self.submit_request(client_id, target, message.deep_copy());
             }
             if let Some(reply) = self.step().into_iter().next() {
-                return Some(reply);
+                return reply;
             }
         }
         panic!(
@@ -852,26 +857,22 @@ impl Simulator {
     #[allow(clippy::cast_possible_truncation)]
     pub fn register_client_with_primary(&mut self, client: &SimClient) {
         let msg = client.register().into_generic();
-        let session = self
-            .await_setup_reply(client.client_id(), 0, &msg, "register_client_with_primary")
-            .map_or(0, |reply| {
-                let header = reply.header();
-                debug_assert_eq!(
-                    header.operation,
-                    iggy_binary_protocol::Operation::Register,
-                    "register_client_with_primary: first reply was not Register"
-                );
-                assert_eq!(
-                    header.client,
-                    client.client_id(),
-                    "register_client_with_primary: reply client_id mismatch \
-                     (expected {}, got {})",
-                    client.client_id(),
-                    header.client,
-                );
-                header.commit
-            });
-        client.bind_session(session);
+        let reply =
+            self.await_setup_reply(client.client_id(), 0, &msg, "register_client_with_primary");
+        let header = reply.header();
+        debug_assert_eq!(
+            header.operation,
+            iggy_binary_protocol::Operation::Register,
+            "register_client_with_primary: first reply was not Register"
+        );
+        assert_eq!(
+            header.client,
+            client.client_id(),
+            "register_client_with_primary: reply client_id mismatch (expected {}, got {})",
+            client.client_id(),
+            header.client,
+        );
+        client.bind_session(header.commit);
 
         // Partition has no `client_table`: at-least-once, no per-client
         // dedup. Consumers dedup via message id / content / producer-id+seq.
@@ -3441,7 +3442,7 @@ mod tests {
             usize::from(replica_count),
             std::iter::once(client_id),
             network_opts,
-            root.path().to_path_buf(),
+            root.path(),
         );
         // Small enough that the ops below cross the margin; the coordinator forces
         // a checkpoint once free slots fall to its margin (64 by default).
@@ -3687,7 +3688,7 @@ mod tests {
         let network_opts = packet::PacketSimulatorOptions {
             node_count: replica_count,
             client_count: 1,
-            seed: 0xF0_2D_0001,
+            seed: 0xF02D_0001,
             ..packet::PacketSimulatorOptions::default()
         };
         let mut sim = Simulator::with_shards_shell(

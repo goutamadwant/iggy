@@ -136,7 +136,7 @@ struct Args {
     clog_duration_mean: Option<u64>,
 }
 
-/// Named network fault profile, in the spirit of TigerBeetle's VOPR modes: one
+/// Named network fault profile, in the spirit of `TigerBeetle`'s VOPR modes: one
 /// flag for "how hostile is the network", rather than eleven.
 ///
 /// Progress falls off steeply with severity, because every lost frame costs a
@@ -388,40 +388,7 @@ fn main() {
         bucket_capacity: 1,
     });
 
-    let client_ids: Vec<u128> = (1..=u128::from(clients)).collect();
-    let mut sim = if args.shell {
-        Simulator::with_shards_shell(
-            usize::from(replicas),
-            1,
-            client_ids.iter().copied(),
-            network_opts,
-        )
-    } else {
-        Simulator::new(
-            usize::from(replicas),
-            client_ids.iter().copied(),
-            network_opts,
-        )
-    };
-    let sim_clients: Vec<SimClient> = client_ids.iter().map(|&id| SimClient::new(id)).collect();
-
-    let ns = IggyNamespace::new(1, 1, 0);
-    sim.init_partition(ns);
-    if args.shell {
-        // The shell resolves a partition request's namespace against committed
-        // metadata, so the stream and topic behind it have to exist as well as the
-        // partition group.
-        sim.seed_stream_topic_partition(ns);
-    }
-    for client in &sim_clients {
-        if args.shell {
-            // Log in rather than bare-register: the dispatch path admits a request
-            // only from a bound session, and the login is what mints one.
-            sim.shell_login(client);
-        } else {
-            sim.register_client_with_primary(client);
-        }
-    }
+    let (mut sim, sim_clients, ns) = build_cluster(&args, replicas, clients, network_opts);
 
     let mut options = WorkloadOptions::new(seed, replicas, vec![ns]);
     options.client_count = clients;
@@ -484,6 +451,51 @@ fn main() {
     println!("workload-fuzz: OK (seed={seed})");
 }
 
+/// Stand up the cluster, seed its namespace, and get every client a session.
+///
+/// Returns the simulator, its clients, and the namespace the workload drives.
+/// The shell path differs in two ways that have to agree: a partition request's
+/// namespace is resolved against committed metadata, so the stream and topic
+/// behind it must exist and not just the partition group; and dispatch admits a
+/// request only from a bound session, which only a login mints.
+fn build_cluster(
+    args: &Args,
+    replicas: u8,
+    clients: u8,
+    network_opts: PacketSimulatorOptions,
+) -> (Simulator, Vec<SimClient>, IggyNamespace) {
+    let client_ids: Vec<u128> = (1..=u128::from(clients)).collect();
+    let mut sim = if args.shell {
+        Simulator::with_shards_shell(
+            usize::from(replicas),
+            1,
+            client_ids.iter().copied(),
+            network_opts,
+        )
+    } else {
+        Simulator::new(
+            usize::from(replicas),
+            client_ids.iter().copied(),
+            network_opts,
+        )
+    };
+    let sim_clients: Vec<SimClient> = client_ids.iter().map(|&id| SimClient::new(id)).collect();
+
+    let ns = IggyNamespace::new(1, 1, 0);
+    sim.init_partition(ns);
+    if args.shell {
+        sim.seed_stream_topic_partition(ns);
+    }
+    for client in &sim_clients {
+        if args.shell {
+            sim.shell_login(client);
+        } else {
+            sim.register_client_with_primary(client);
+        }
+    }
+    (sim, sim_clients, ns)
+}
+
 /// Which protocol commands the run actually delivered, and which it never
 /// reached.
 ///
@@ -524,9 +536,9 @@ fn print_coverage(workload: &Workload) {
     );
     for action in Action::iter() {
         let commits = stats.commits(action);
-        let (denied, status) = stats.denials_per_action[action as usize];
-        if commits > 0 || denied > 0 {
-            println!("  {action:?}: {commits} commits, {denied} denied (last status {status})");
+        let (refused, code) = stats.denials_per_action[action as usize];
+        if commits > 0 || refused > 0 {
+            println!("  {action:?}: {commits} commits, {refused} denied (last status {code})");
         }
     }
 }

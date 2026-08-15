@@ -32,9 +32,11 @@ pub const DEFAULT_REQUEST_TIMEOUT_TICKS: u64 = 200;
 /// something to repair.
 pub const DEFAULT_CRASH_STABILITY_TICKS: u64 = 300;
 
-/// Default [`WorkloadOptions::restart_stability_ticks`]. Long enough for a
-/// rejoined replica to finish catching up before it becomes a crash candidate
-/// again, so a run does not consist entirely of half-repaired replicas.
+/// Default [`WorkloadOptions::restart_stability_ticks`].
+///
+/// Long enough for a rejoined replica to finish catching up before it becomes a
+/// crash candidate again, so a run does not consist entirely of half-repaired
+/// replicas.
 pub const DEFAULT_RESTART_STABILITY_TICKS: u64 = 500;
 
 /// Per-action sampling weights as percentages. Unlisted variants default
@@ -116,6 +118,10 @@ impl ActionWeights {
     /// `Action::COUNT` does not divide 100, so the first `100 % COUNT` actions
     /// carry one extra point. Spread that way rather than asserting the count
     /// divides evenly, so appending an `Action` never breaks this preset.
+    ///
+    /// # Panics
+    /// Panics if the spread weights do not sum to 100, which would mean the
+    /// remainder arithmetic above is wrong rather than the caller.
     #[must_use]
     pub fn uniform() -> Self {
         use strum::IntoEnumIterator;

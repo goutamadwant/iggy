@@ -4787,9 +4787,9 @@ mod tests {
     /// metadata workload under crash/restart injection until this was gated on the
     /// journal instead.
     ///
-    /// TigerBeetle sidesteps the question by keeping a single frontier: `self.op`
-    /// IS the log head, and `on_prepare` routes anything at or below it to
-    /// `on_repair`, which re-acks a prepare already held.
+    /// `TigerBeetle` sidesteps the question by keeping a single frontier:
+    /// `self.op` IS the log head, and `on_prepare` routes anything at or below it
+    /// to `on_repair`, which re-acks a prepare already held.
     #[compio::test]
     async fn backup_admits_the_prepare_its_journal_needs_despite_a_leading_sequencer() {
         const CLIENT: u128 = 1;
