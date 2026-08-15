@@ -3483,6 +3483,36 @@ where
         // recovered offset space) meaningful.
         if let Some((log, durable_offset, write_offset)) = retained {
             partition.adopt_retained_log(log, durable_offset, write_offset);
+            // Restore the consensus frontier from the log we just adopted, the
+            // partition-plane counterpart of what `restore_metadata_consensus`
+            // does for shard 0. Without it a restarted replica rebuilds its
+            // consensus at op 0 while holding a log full of ops, and then
+            // ADVERTISES that empty frontier in its `DoViewChange`. A quorum of
+            // such replicas merges to a log shorter than what peers have already
+            // committed, and the new primary replays from the start into a replica
+            // whose `commit_min` is far ahead, tripping the sequential-advance
+            // assert in `advance_commit_min`.
+            //
+            // The commit watermark is the highest `commit` any journaled prepare
+            // stamped: a lower bound, since a prepare records the primary's commit
+            // point at send time, so the true point may be one higher and
+            // re-commits on rejoin. Same rule `SimJournal::recovery_commit_watermark`
+            // applies on the metadata side.
+            let journal = &partition.log.journal().inner;
+            if let Some(head) = journal.last_op() {
+                let mut watermark = 0;
+                for op in 1..=head {
+                    if let Some(header) = journal.header_by_op(op) {
+                        watermark = watermark.max(header.commit);
+                    }
+                }
+                let consensus = partition.consensus();
+                consensus.sequencer().set_sequence(head);
+                consensus.restore_commit_state(watermark, watermark);
+                if let Some(header) = journal.header_by_op(head) {
+                    consensus.set_last_prepare_checksum(header.checksum);
+                }
+            }
         }
         // The SAME call the boot paths make, not a copy of it: this restore is
         // a max against what the segments already proved, and a harness running
