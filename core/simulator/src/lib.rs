@@ -645,6 +645,31 @@ impl Simulator {
         client_replies
     }
 
+    /// Stamp a metadata snapshot watermark on one replica, standing in for a
+    /// checkpoint that superseded everything at or below `op`.
+    ///
+    /// The simulator does not checkpoint: `IggyMetadata` is built without a data
+    /// directory, so it has no `SnapshotCoordinator` and `checkpoint_if_needed`
+    /// returns immediately. That left the watermark permanently at zero, so
+    /// nothing was ever evictable, the repair server never had a compacted prefix
+    /// to skip, and `RangeEvicted` -- the only signal that converts a repair into
+    /// a state transfer -- could not occur however the cluster was driven.
+    ///
+    /// Stamping the number alone reaches the whole escalation without producing
+    /// snapshot bytes to transfer. That splits the problem honestly: the protocol
+    /// path can be covered now, while a transfer that installs real state needs
+    /// the coordinator seam.
+    ///
+    /// # Panics
+    /// If the replica has no metadata journal (only shard 0 owns one).
+    pub fn stamp_metadata_snapshot(&self, replica_idx: usize, op: u64) {
+        use journal::Journal;
+
+        self.replicas[replica_idx]
+            .metadata_journal
+            .set_snapshot_op(op);
+    }
+
     /// Take the clients evicted since the last call.
     ///
     /// A driver must consume these: an evicted client's session is gone, so its
@@ -3289,6 +3314,115 @@ mod tests {
     /// pipeline to `PIPELINE_PREPARE_QUEUE_MAX`; a request on `ns_b`
     /// still commits while `ns_a` is wedged (no quorum without backup
     /// acks); lifting the block drains `ns_a` completely.
+    /// A backup whose gap sits below the serving peer's snapshot floor is told
+    /// `RangeEvicted` and converts its repair into a state transfer.
+    ///
+    /// This is the only route into state transfer. Journal repair closes a gap by
+    /// replaying ops; when the peer has compacted past them there is nothing left
+    /// to replay, and `RangeEvicted` is the authoritative signal saying so. Every
+    /// way a replica falls behind a checkpoint converges on it -- a fresh node
+    /// joining an already-checkpointed cluster, a healed partition, a restart
+    /// whose gap is below the floor.
+    ///
+    /// The simulator never checkpoints (no `SnapshotCoordinator`, see
+    /// `Simulator::stamp_metadata_snapshot`), so the watermark sat at zero and
+    /// this whole branch was unreachable. Stamping the number is enough for the
+    /// escalation; the transfer cannot install real state without snapshot bytes,
+    /// which is the next task.
+    ///
+    /// Asserts on frames delivered rather than on internal state, so it fails if
+    /// the escalation stops happening even should the local bookkeeping still look
+    /// plausible.
+    #[test]
+    fn repair_below_the_snapshot_floor_escalates_to_state_transfer() {
+        use iggy_binary_protocol::Command2;
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0xE71C_0001,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::new(
+            usize::from(replica_count),
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let client = SimClient::new(client_id);
+        sim.register_client_with_primary(&client);
+
+        // Commit a prefix the lagging replica will later be missing.
+        for sequence in 0..6u32 {
+            let msg = client.create_stream(&format!("wl-before-{sequence}"));
+            sim.submit_request(client_id, 0, msg.into_generic());
+            for _ in 0..60 {
+                sim.step();
+            }
+        }
+
+        // Take a backup down and keep committing, so its log falls behind.
+        let lagging = 2u8;
+        sim.replica_crash(lagging);
+        for sequence in 0..6u32 {
+            let msg = client.create_stream(&format!("wl-during-{sequence}"));
+            sim.submit_request(client_id, 0, msg.into_generic());
+            for _ in 0..60 {
+                sim.step();
+            }
+        }
+
+        // Compact past everything the lagging replica is missing, on the peers
+        // that will serve its repair. Its gap is now entirely below their floor,
+        // which is exactly the state no amount of journal repair can fix.
+        let floor = metadata_commit(&sim, 0);
+        assert!(
+            floor > 0,
+            "nothing committed, so there is no prefix to compact and nothing to evict"
+        );
+        for replica_idx in 0..usize::from(replica_count) {
+            if replica_idx != usize::from(lagging) {
+                sim.stamp_metadata_snapshot(replica_idx, floor);
+            }
+        }
+
+        sim.replica_restart(lagging);
+        for _ in 0..4_000 {
+            sim.step();
+        }
+
+        assert!(
+            sim.network.delivered_any(Command2::RangeEvicted),
+            "no RangeEvicted: the serving peers never announced a compacted \
+             prefix, so the rejoining replica is still trying to repair ops that \
+             cannot be served"
+        );
+        assert!(
+            sim.network.delivered_any(Command2::RequestStateTransfer),
+            "RangeEvicted did not convert into a state transfer, so the replica \
+             has no route back to the cluster's state"
+        );
+        assert!(
+            sim.network.delivered_any(Command2::StateTransferTarget),
+            "the serving peer never answered with a transfer target, so the \
+             escalation stopped at the request and covers only half the handshake"
+        );
+
+        // The handshake reaches the target descriptor and goes no further:
+        // `RequestStateChunk` and `StateChunk` need artifacts to fetch, and the
+        // serving peer has no checkpoint to build them from. The requester
+        // therefore re-arms every round rather than converging, which is why this
+        // test asserts on the handshake instead of on the transfer completing.
+        // Wiring a snapshot coordinator is what closes that gap.
+    }
+
     /// A client that dials a BACKUP still gets a working session, and the login
     /// travels as a forwarded consensus proposal rather than a redirect.
     ///

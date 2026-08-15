@@ -104,6 +104,9 @@ pub struct SimJournal<S: Storage> {
     /// retained head in O(1) without scanning `headers` (see
     /// [`SimJournal::last_op`]).
     last_op: Cell<Option<u64>>,
+    /// Snapshot watermark; see the `Journal::snapshot_op` impl for why a real
+    /// value here is what makes `RangeEvicted` reachable at all.
+    snapshot_op: Cell<u64>,
     /// Debug-only single-accessor tripwire. `entry` / `append` hold a
     /// [`JournalAccessGuard`] across their whole body, including the storage
     /// `.await`, so if a suspending storage tier ever let a second task touch
@@ -121,6 +124,7 @@ impl<S: Storage + Default> Default for SimJournal<S> {
             offsets: UnsafeCell::new(HashMap::new()),
             write_offset: Cell::new(0),
             last_op: Cell::new(None),
+            snapshot_op: Cell::new(0),
             #[cfg(debug_assertions)]
             accessing: Cell::new(false),
         }
@@ -207,15 +211,27 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal<S> for SimJournal<S> {
         Ok(doomed.len())
     }
 
-    /// The simulated journal retains everything for the run, so nothing is
-    /// ever superseded by a snapshot. Answered explicitly (the trait has no
-    /// default) so a simulated state transfer has to opt into a watermark
-    /// rather than silently inherit one that never moves.
+    /// The snapshot watermark: entries at or below it are evictable.
+    ///
+    /// Load-bearing despite the simulated journal retaining every entry it is
+    /// given. The repair server floors what it will serve at `snapshot_op + 1`
+    /// and announces the skipped prefix as `RangeEvicted`, which is the one
+    /// authoritative "repair cannot close this gap" signal and the only route
+    /// into state transfer. While this answered a constant 0, no range was ever
+    /// evictable, so `RangeEvicted` and every state-transfer frame behind it were
+    /// unreachable no matter what else the harness did.
     fn snapshot_op(&self) -> u64 {
-        0
+        self.snapshot_op.get()
     }
 
-    fn set_snapshot_op(&self, _op: u64) {}
+    /// Advance the watermark, never lower it. Production advances it when a
+    /// checkpoint supersedes a prefix or a transfer installs one; both only move
+    /// forward, and a retreating floor would re-offer ops the serving side has
+    /// already told a peer are gone.
+    fn set_snapshot_op(&self, op: u64) {
+        let current = self.snapshot_op.get();
+        self.snapshot_op.set(current.max(op));
+    }
 
     // TODO(hubcio): validate that the caller's checksum matches the stored
     // header - currently this looks up by op only, ignoring the checksum.
