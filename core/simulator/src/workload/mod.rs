@@ -93,6 +93,9 @@ pub struct Workload {
     now: u64,
     /// Total resends issued, for the run summary.
     resends: u64,
+    /// Client evictions survived, for the run summary. Only the dispatch shell
+    /// produces them, and in practice only once replicas restart under it.
+    evictions: u64,
     /// Debug counter for `sample()` returning `None` (a targeted outcome whose
     /// shadow precondition is unmet). Flags PRNG-trace drift during development.
     samples_none: u64,
@@ -121,6 +124,7 @@ impl Workload {
             outstanding: BTreeMap::new(),
             now: 0,
             resends: 0,
+            evictions: 0,
             samples_none: 0,
             strict_outcome_oracle,
         }
@@ -149,6 +153,42 @@ impl Workload {
     #[must_use]
     pub const fn resends(&self) -> u64 {
         self.resends
+    }
+
+    /// Total client evictions survived.
+    #[must_use]
+    pub const fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Forget everything outstanding for a client the cluster evicted.
+    ///
+    /// An eviction is session-terminal: the server refused the request BEFORE
+    /// commit (`Eviction(NoSession)` from an unbound transport, which is what a
+    /// replica restart leaves behind, since session bindings live in the
+    /// per-connection `SessionManager` and do not survive it). The client logs in
+    /// again and carries on.
+    ///
+    /// Resending is not an option: the retained message carries the old session
+    /// id, so it would be refused again. A fresh sample after the re-login
+    /// carries the new one.
+    ///
+    /// The forgotten request's fate is genuinely unknown, which is why this
+    /// disarms the strict outcome oracle. The refusal proves only that the
+    /// ATTEMPT that drew it did not commit, and that attempt may have been a
+    /// resend of a request whose original had already committed with its reply
+    /// lost. The shadow is then missing an effect that did happen, and every
+    /// later outcome targeted against it can disagree with what commits. Losing
+    /// the oracle for the rest of the run is the honest price; claiming the
+    /// shadow is still authoritative would turn a known unknown into a spurious
+    /// failure.
+    ///
+    /// Returns how many requests were forgotten.
+    pub fn forget_evicted_client(&mut self, client_id: u128) -> usize {
+        self.evictions += 1;
+        self.strict_outcome_oracle = false;
+        self.outstanding.retain(|&(owner, _), _| owner != client_id);
+        self.auditor.forget_client(client_id)
     }
 
     /// Requests whose reply has not arrived within
@@ -541,7 +581,7 @@ pub fn run_with_faults(
             apply_sim_commands(sim, &cmds);
             replies_seen += 1;
         }
-        assert_no_evictions(sim);
+        recover_evicted_clients(sim, workload, clients);
         invariants.check(sim, workload);
         if replies_seen >= replies_target {
             break;
@@ -688,30 +728,41 @@ impl FaultInjector {
     }
 }
 
-/// Fail loudly if the cluster evicted a client, which the workload cannot yet
-/// survive.
+/// Log any evicted client back in, which is what a real client does.
 ///
-/// An eviction ends the session: the client's outstanding requests become
-/// unanswerable and it must log in again before submitting anything. Modelling
-/// that means re-establishing the session mid-run and discarding the auditor's
-/// expectations for it, which the driver does not do. Until it does, an eviction
-/// presents as a client that has silently stopped making progress, so name it
-/// here rather than let the run time out with no explanation.
+/// A replica restart drops its `SessionManager`, since bindings are
+/// per-connection and volatile, so a client that had a session there is unbound
+/// and its next replicated request is refused with `Eviction(NoSession)`. The
+/// client table itself is replicated metadata and survives, so the re-login
+/// rebinds the existing entry (bumping its fence epoch) and request numbering
+/// continues rather than restarting.
 ///
-/// Only reachable through the dispatch shell, and in practice only once crashes
-/// and restarts are also in play.
+/// Outstanding requests are forgotten rather than resent: the refused request
+/// never committed, and the message the retry buffer holds carries the old
+/// session id, so resending it would only be refused again. See
+/// [`Workload::forget_evicted_client`].
 ///
 /// # Panics
-/// If any client was evicted since the last step.
-fn assert_no_evictions(sim: &mut Simulator) {
-    let evicted = sim.take_evictions();
-    assert!(
-        evicted.is_empty(),
-        "cluster evicted client(s) {evicted:?}: their sessions are gone, so their \
-         outstanding requests can never be answered and their next request is \
-         refused. The workload does not re-establish a session, so the run cannot \
-         continue"
-    );
+/// If an evicted client id is not one the driver knows about, which would mean
+/// the simulator and the driver disagree about who is connected.
+fn recover_evicted_clients(sim: &mut Simulator, workload: &mut Workload, clients: &[SimClient]) {
+    for client_id in sim.take_evictions() {
+        let client = clients
+            .iter()
+            .find(|client| client.client_id() == client_id)
+            .unwrap_or_else(|| {
+                panic!("cluster evicted unknown client {client_id}: not one the driver drives")
+            });
+        workload.forget_evicted_client(client_id);
+        // Any live replica: a client dialing a backup is a supported path (the
+        // backup forwards the register), and the default target may itself be the
+        // replica whose restart caused the eviction, in which case the login just
+        // times out.
+        let Some(target) = (0..sim.replica_count).find(|idx| !sim.is_crashed(*idx)) else {
+            continue;
+        };
+        sim.shell_login_via(client, target);
+    }
 }
 
 /// Submit every request whose reply is overdue (see [`Workload::due_resends`]).

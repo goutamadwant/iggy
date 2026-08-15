@@ -606,9 +606,16 @@ impl Simulator {
         message: &Message<GenericHeader>,
         label: &str,
     ) -> Message<ReplyHeader> {
+        let mut target = target;
         for step in 0..SETUP_TOTAL_STEPS {
             if step % SETUP_RETRY_STEPS == 0 {
                 self.submit_request(client_id, target, message.deep_copy());
+                // Rotate, exactly as the workload's resend path does. Retrying the
+                // same replica forever is enough on a perfect network and useless
+                // once one is partitioned or crashed mid-handshake: a register has
+                // to reach the metadata primary, and the replica that looked live
+                // when this started may be neither reachable nor able to forward.
+                target = (target + 1) % self.replica_count.max(1);
             }
             if let Some(reply) = self.step().into_iter().next() {
                 return reply;

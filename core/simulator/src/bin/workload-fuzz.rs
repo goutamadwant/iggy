@@ -526,13 +526,14 @@ fn print_coverage(workload: &Workload) {
     let stats = workload.auditor.stats();
     println!(
         "coverage: replies_seen={} replies_unknown={} committed_rejections={} \
-         samples_none={} resends={} denials={}",
+         samples_none={} resends={} denials={} evictions={}",
         stats.replies_seen,
         stats.replies_unknown,
         stats.committed_rejections,
         workload.samples_none(),
         workload.resends(),
         stats.denials,
+        workload.evictions(),
     );
     for action in Action::iter() {
         let commits = stats.commits(action);

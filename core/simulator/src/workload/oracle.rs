@@ -116,6 +116,14 @@ pub fn drive_to_quiesce(sim: &mut Simulator, workload: &mut Workload, max_ticks:
             let cmds = workload.on_reply(&reply);
             apply_sim_commands(sim, &cmds);
         }
+        // A resend can land on a transport a restart left unbound, which the
+        // server refuses with an eviction. No re-login here, unlike the active
+        // driver: the drain submits nothing new, and the refused request was
+        // rejected before commit, so forgetting it is what "drained" means for a
+        // request that can never be answered.
+        for client_id in sim.take_evictions() {
+            workload.forget_evicted_client(client_id);
+        }
         if workload.total_in_flight() == 0 {
             drained = true;
             break;

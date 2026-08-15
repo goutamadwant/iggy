@@ -209,6 +209,18 @@ impl ServerAuditor {
         &self.stats
     }
 
+    /// Drop every in-flight expectation for `client`, returning how many went.
+    ///
+    /// For a client the cluster evicted: its session is gone, so nothing it had
+    /// outstanding will ever be answered and an expectation left behind would
+    /// wait forever. The requests themselves were refused before commit, so
+    /// forgetting them loses no committed state.
+    pub fn forget_client(&mut self, client: u128) -> usize {
+        let before = self.in_flight.len();
+        self.in_flight.retain(|&(owner, _), _| owner != client);
+        before - self.in_flight.len()
+    }
+
     /// The action of an outstanding request, if one is recorded for `key`.
     /// Diagnostic only: names what a stalled run is waiting on, which the bare
     /// `(client, request)` pair cannot.
