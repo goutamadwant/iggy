@@ -462,6 +462,23 @@ impl Simulator {
     /// If no login reply arrives within [`SETUP_TOTAL_STEPS`], or it carries no
     /// session.
     pub fn shell_login(&mut self, client: &SimClient) {
+        self.shell_login_via(client, 0);
+    }
+
+    /// [`Self::shell_login`] against a chosen replica.
+    ///
+    /// Dialing a BACKUP takes a different path than dialing the primary, and it
+    /// is the only way to reach register forwarding: the backup verifies the
+    /// credentials itself and sends only the consensus proposal onward as
+    /// `ForwardRegister`, parking the login until the matching
+    /// `ForwardRegisterResult` comes back, then answering on the connection it
+    /// owns. A client that always dials the primary never produces one of those
+    /// four frames.
+    ///
+    /// # Panics
+    /// If no login reply arrives within [`SETUP_TOTAL_STEPS`], or it carries no
+    /// session.
+    pub fn shell_login_via(&mut self, client: &SimClient, target: u8) {
         // Register the client's connection metadata on every replica, as
         // `install_client_fd` does in production. `ensure_transport_connection`
         // reads it to admit the connection into the SessionManager, which the
@@ -481,7 +498,7 @@ impl Simulator {
         // The login reply carries the assigned session in `op`
         // (`build_reply_with_body` maps the session field to `op`).
         let session = self
-            .await_setup_reply(client.client_id(), 0, &msg, "shell_login")
+            .await_setup_reply(client.client_id(), target, &msg, "shell_login")
             .map_or(0, |reply| reply.header().op);
         assert!(session > 0, "shell_login: login reply carried no session");
         client.bind_session(session);
@@ -3272,6 +3289,103 @@ mod tests {
     /// pipeline to `PIPELINE_PREPARE_QUEUE_MAX`; a request on `ns_b`
     /// still commits while `ns_a` is wedged (no quorum without backup
     /// acks); lifting the block drains `ns_a` completely.
+    /// A client that dials a BACKUP still gets a working session, and the login
+    /// travels as a forwarded consensus proposal rather than a redirect.
+    ///
+    /// Register forwarding exists so a client need not find the primary itself:
+    /// the backup verifies the credentials locally, sends only the proposal on as
+    /// `ForwardRegister`, parks the login until the matching
+    /// `ForwardRegisterResult` returns, then answers on the connection it owns.
+    /// The whole subsystem landed with no deterministic coverage, and could not
+    /// have any while the harness only ever dialed the primary.
+    ///
+    /// Asserts the four frames were delivered rather than inferring them from a
+    /// working session: dialing a backup would also "work" if the server had
+    /// silently redirected the client instead, which is the design this replaced.
+    #[test]
+    fn login_via_backup_forwards_the_register_to_the_primary() {
+        use iggy_binary_protocol::Command2;
+
+        server_common::MemoryPool::init_pool(&server_common::MemoryPoolConfigOther {
+            enabled: false,
+            size: iggy_common::IggyByteSize::from(0u64),
+            bucket_capacity: 1,
+        });
+
+        let replica_count: u8 = 3;
+        let client_id: u128 = 1;
+        let network_opts = packet::PacketSimulatorOptions {
+            node_count: replica_count,
+            client_count: 1,
+            seed: 0xF0_2D_0001,
+            ..packet::PacketSimulatorOptions::default()
+        };
+        let mut sim = Simulator::with_shards_shell(
+            usize::from(replica_count),
+            1,
+            std::iter::once(client_id),
+            network_opts,
+        );
+        let ns = IggyNamespace::new(1, 1, 0);
+        sim.init_partition(ns);
+        sim.seed_stream_topic_partition(ns);
+
+        // Replica 0 leads both planes at view 0, so replica 1 is a backup and the
+        // login has to be forwarded.
+        let client = SimClient::new(client_id);
+        sim.shell_login_via(&client, 1);
+
+        assert!(
+            sim.network.delivered_any(Command2::ForwardRegister),
+            "no ForwardRegister crossed the wire: the backup answered the login \
+             itself, so this covers nothing"
+        );
+        assert!(
+            sim.network.delivered_any(Command2::ForwardRegisterResult),
+            "the forwarded register was never answered, so the login below \
+             succeeded by some other route"
+        );
+
+        // Log out on the SAME backup, which both covers the other half of the
+        // forwarding subsystem and proves the session was real: only a bound
+        // session can be torn down, and the teardown replicates through the
+        // primary exactly as the register did.
+        //
+        // A logout, not a data request, because the session belongs to the
+        // connection: a real client holds one connection to one replica, and a
+        // partition write is refused by a backup for routing reasons
+        // (`TransientNotAccepted`) which says nothing about the session.
+        let logout = client.logout();
+        let request = logout.header().request;
+        sim.submit_request(client_id, 1, logout.into_generic());
+        let mut answered = false;
+        for _ in 0..400 {
+            if let Some(reply) = sim
+                .step()
+                .into_iter()
+                .find(|reply| reply.header().request == request)
+            {
+                assert_eq!(
+                    reply.header().status,
+                    0,
+                    "logout on the forwarded session was refused (status {})",
+                    reply.header().status,
+                );
+                answered = true;
+                break;
+            }
+        }
+        assert!(answered, "no reply to the logout issued on the backup");
+        assert!(
+            sim.network.delivered_any(Command2::ForwardLogout),
+            "the backup committed the logout without asking the primary"
+        );
+        assert!(
+            sim.network.delivered_any(Command2::ForwardLogoutResult),
+            "the forwarded logout was never answered"
+        );
+    }
+
     /// The workload drains and converges when every request goes through the
     /// server's real dispatch handlers rather than the raw `on_message` path.
     ///

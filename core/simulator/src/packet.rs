@@ -241,7 +241,61 @@ pub struct PacketSimulator {
     auto_partition_nodes: Vec<usize>,
     /// Reusable buffer for delivered packets.
     delivered: Vec<Packet>,
+    /// Packets actually delivered, per [`Command2`] discriminant.
+    ///
+    /// Counted at delivery, past every drop path, so a command shows up only if a
+    /// process really received one. This is how a run answers which parts of the
+    /// protocol it exercised: the harness reaches far more of the command space
+    /// than any single scenario drives, and a test asserting a command was
+    /// observed is the difference between covering a path and merely compiling it.
+    command_counts: [u64; COMMAND_COUNT_MAX],
 }
+
+/// One past the highest [`Command2`] discriminant, sizing [`COMMAND_LABELS`] and
+/// the delivery counters. Raising it is part of adding a command.
+pub const COMMAND_COUNT_MAX: usize = 30;
+
+/// Names for each [`Command2`] discriminant, so a coverage report reads as
+/// protocol rather than as integers. Indexed by discriminant; the trailing
+/// assert keeps it aligned with the enum.
+pub const COMMAND_LABELS: [&str; COMMAND_COUNT_MAX] = [
+    "Reserved",
+    "Ping",
+    "Pong",
+    "PingClient",
+    "PongClient",
+    "Request",
+    "Prepare",
+    "PrepareOk",
+    "Reply",
+    "Commit",
+    "StartViewChange",
+    "DoViewChange",
+    "StartView",
+    "Eviction",
+    "ReplicaHello",
+    "ReplicaChallenge",
+    "ReplicaFinish",
+    "RequestStartView",
+    "RequestPrepares",
+    "RepairPrepare",
+    "RepairDone",
+    "RangeEvicted",
+    "RequestStateTransfer",
+    "StateTransferTarget",
+    "RequestStateChunk",
+    "StateChunk",
+    "ForwardRegister",
+    "ForwardRegisterResult",
+    "ForwardLogout",
+    "ForwardLogoutResult",
+];
+
+const _: () = {
+    // Adding a command without extending the table above would silently report it
+    // under the wrong name, or index past the end.
+    assert!(Command2::ForwardLogoutResult as usize == COMMAND_COUNT_MAX - 1);
+};
 
 impl PacketSimulator {
     /// Create a new packet simulator.
@@ -322,6 +376,7 @@ impl PacketSimulator {
             auto_partition_stability: initial_stability,
             auto_partition_nodes: (0..node_count).collect(),
             delivered: Vec::new(),
+            command_counts: [0; COMMAND_COUNT_MAX],
         }
     }
 
@@ -524,6 +579,7 @@ impl PacketSimulator {
             delivered,
             max_processes,
             next_index,
+            command_counts,
             ..
         } = self;
 
@@ -580,12 +636,27 @@ impl PacketSimulator {
                         tracing::trace!("packet replayed");
                     }
 
+                    command_counts[command as usize] += 1;
                     delivered.push(packet);
                 }
             }
         }
 
         std::mem::take(&mut self.delivered)
+    }
+
+    /// Packets delivered so far, per [`Command2`] discriminant. See
+    /// [`Self::command_counts`]'s field docs for why this counts at delivery.
+    #[must_use]
+    pub const fn command_counts(&self) -> &[u64; COMMAND_COUNT_MAX] {
+        &self.command_counts
+    }
+
+    /// Whether any packet of this command has been delivered. The question a
+    /// coverage assertion actually asks.
+    #[must_use]
+    pub const fn delivered_any(&self, command: Command2) -> bool {
+        self.command_counts[command as usize] > 0
     }
 
     /// Return a previously taken buffer for reuse.

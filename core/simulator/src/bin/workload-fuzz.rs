@@ -47,7 +47,7 @@ use server_common::sharding::IggyNamespace;
 use server_common::{MemoryPool, MemoryPoolConfigOther};
 use simulator::Simulator;
 use simulator::client::SimClient;
-use simulator::packet::{PacketSimulatorOptions, PartitionMode, PartitionSymmetry};
+use simulator::packet::{COMMAND_LABELS, PacketSimulatorOptions, PartitionMode, PartitionSymmetry};
 use simulator::workload::actions::Action;
 use simulator::workload::options::{ActionWeights, WorkloadOptions};
 use simulator::workload::{FaultInjector, Workload, oracle, run_with_faults};
@@ -480,7 +480,33 @@ fn main() {
         print_coverage(&workload);
     }
 
+    print_command_coverage(&sim);
     println!("workload-fuzz: OK (seed={seed})");
+}
+
+/// Which protocol commands the run actually delivered, and which it never
+/// reached.
+///
+/// The harness wires far more of the command space than any one scenario drives,
+/// and "is this path covered?" was previously answered by grepping the source.
+/// Counted at delivery, so a command listed here really arrived somewhere.
+fn print_command_coverage(sim: &Simulator) {
+    let counts = sim.network.command_counts();
+    let mut seen: Vec<String> = Vec::new();
+    let mut unseen: Vec<&str> = Vec::new();
+    for (discriminant, &count) in counts.iter().enumerate() {
+        let label = COMMAND_LABELS[discriminant];
+        if label == "Reserved" {
+            continue;
+        }
+        if count > 0 {
+            seen.push(format!("{label}={count}"));
+        } else {
+            unseen.push(label);
+        }
+    }
+    println!("commands delivered: {}", seen.join(" "));
+    println!("commands never delivered: {}", unseen.join(" "));
 }
 
 /// Reply, rejection and resend counters plus per-action commits.

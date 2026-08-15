@@ -231,6 +231,18 @@ impl SimClient {
             .expect("login request must be valid")
     }
 
+    /// Tear down this client's bound session.
+    ///
+    /// Replicates through the metadata plane like any other session op, so it
+    /// carries the bound session and a metadata request id and needs no body. A
+    /// logout issued to a BACKUP is what produces `ForwardLogout`: the backup owns
+    /// the connection but not the log, so it asks the primary to commit the
+    /// teardown and answers the client itself once `ForwardLogoutResult` returns.
+    #[must_use]
+    pub fn logout(&self) -> Message<RoutedRequestHeader> {
+        self.build_request(Operation::Logout, &[])
+    }
+
     /// # Panics
     /// Panics if the stream name is not a valid wire name.
     pub fn create_stream(&self, name: &str) -> Message<RoutedRequestHeader> {
