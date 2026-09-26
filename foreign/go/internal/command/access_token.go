@@ -32,8 +32,8 @@ func (c *CreatePersonalAccessToken) MarshalBinary() ([]byte, error) {
 	length := 1 + len(c.Name) + 8
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(c.Name))
-	copy(bytes[1:], c.Name)
-	binary.LittleEndian.PutUint32(bytes[len(bytes)-4:], c.Expiry)
+	copy(bytes[1:1+len(c.Name)], c.Name)
+	binary.LittleEndian.PutUint64(bytes[1+len(c.Name):], uint64(c.Expiry))
 	return bytes, nil
 }
 
