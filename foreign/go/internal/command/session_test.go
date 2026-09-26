@@ -18,6 +18,7 @@
 package command
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 
@@ -47,5 +48,26 @@ func TestSerialize_LoginUser_ContainsVersion(t *testing.T) {
 
 	if version != iggcon.Version {
 		t.Errorf("Version mismatch. Expected: %q, Got: %q", iggcon.Version, version)
+	}
+}
+
+func TestLoginWithPersonalAccessTokenMarshalBinary(t *testing.T) {
+	got, err := (&LoginWithPersonalAccessToken{Token: "token"}).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{5, 't', 'o', 'k', 'e', 'n'}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("body = %v, want %v", got, want)
+	}
+}
+
+func TestLogoutUserMarshalBinary(t *testing.T) {
+	got, err := (&LogoutUser{}).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("body = %v, want empty", got)
 	}
 }
