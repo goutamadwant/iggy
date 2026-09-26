@@ -25,6 +25,39 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
+func TestUserLookupPasswordAndDeleteMarshalBinary(t *testing.T) {
+	userID, err := iggcon.NewIdentifier("u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherID, err := iggcon.NewIdentifier(uint32(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name    string
+		command Command
+		want    []byte
+	}{
+		{"GetUser", &GetUser{Id: userID}, []byte{2, 1, 'u'}},
+		{"GetUsers", &GetUsers{}, []byte{}},
+		{"ChangePassword", &ChangePassword{UserID: userID, CurrentPassword: "old", NewPassword: "new"},
+			[]byte{2, 1, 'u', 3, 'o', 'l', 'd', 3, 'n', 'e', 'w'}},
+		{"DeleteUser", &DeleteUser{Id: otherID}, []byte{1, 4, 2, 0, 0, 0}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := test.command.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, test.want) {
+				t.Fatalf("body = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestSerialize_CreateUser_NilPermissions(t *testing.T) {
 	request := CreateUser{
 		Username: "u",
