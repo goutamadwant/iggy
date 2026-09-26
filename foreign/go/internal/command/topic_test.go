@@ -25,6 +25,37 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
+func TestTopicLookupAndDeleteMarshalBinary(t *testing.T) {
+	streamID, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := iggcon.NewIdentifier("t")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name    string
+		command Command
+		want    []byte
+	}{
+		{"GetTopic", &GetTopic{StreamId: streamID, TopicId: topicID}, []byte{1, 4, 1, 0, 0, 0, 2, 1, 't'}},
+		{"GetTopics", &GetTopics{StreamId: streamID}, []byte{1, 4, 1, 0, 0, 0}},
+		{"DeleteTopic", &DeleteTopic{StreamId: streamID, TopicId: topicID}, []byte{1, 4, 1, 0, 0, 0, 2, 1, 't'}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := test.command.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, test.want) {
+				t.Fatalf("body = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestSerialize_CreateTopic_ServerDefaults(t *testing.T) {
 	streamId, _ := iggcon.NewIdentifier("stream")
 	request := CreateTopic{
