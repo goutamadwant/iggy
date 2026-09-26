@@ -80,3 +80,34 @@ func TestSerialize_UpdateStream(t *testing.T) {
 		t.Errorf("Test case 1 failed. \nExpected:\t%v\nGot:\t\t%v", expected, serialized1)
 	}
 }
+
+func TestStreamLookupAndDeleteMarshalBinary(t *testing.T) {
+	streamID, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamName, err := iggcon.NewIdentifier("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name    string
+		command Command
+		want    []byte
+	}{
+		{"GetStream", &GetStream{StreamId: streamID}, []byte{1, 4, 1, 0, 0, 0}},
+		{"GetStreams", &GetStreams{}, []byte{}},
+		{"DeleteStream", &DeleteStream{StreamId: streamName}, []byte{2, 1, 's'}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := test.command.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, test.want) {
+				t.Fatalf("body = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
